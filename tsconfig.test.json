@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "types": ["bun"],
+    "customConditions": ["bun"]
+  },
+  "include": ["**/src/**/*", "**/tests/types/**/*"],
+  "exclude": ["node_modules", "**/dist/**"]
+}

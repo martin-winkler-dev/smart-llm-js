@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/openai-compatible" },
+    { "path": "./packages/deepseek" },
+    { "path": "./packages/gemini" },
+    { "path": "./packages/groq" },
+    { "path": "./packages/ollama" }
+  ]
+}
