@@ -156,12 +156,7 @@ export type LlmDefaults = Pick<
     'temperature' | 'top_p' | 'max_tokens' | 'max_completion_tokens' | 'seed' | 'stop'
 >;
 
-/**
- * **Per-call options**: abort signal and provider-specific extra parameters.
- *
- * - `signal`: abort signal cancelling wait or ongoing network request
- * - `extra`: provider-specific parameters merged over provider and model extras
- */
+/** Per-call options including abort signal and provider-specific extra parameters. */
 export type LlmCallOptions = { signal?: AbortSignal; extra?: Record<string, unknown> };
 
 // -------------------------------------------------------------------
@@ -249,12 +244,7 @@ export type LlmEmbedTask = 'query' | 'document' | 'similarity' | 'classification
 /** Text to embed: string, or text with title for document task. */
 export type LlmEmbedInput = string | { text: string; title?: string };
 
-/**
- * **Embedding request**: vector generation request for one or more inputs.
- *
- * - `input`: texts split across provider calls bounded by maxInputs
- * - `task`: embedding task type; dimensions: output vector size
- */
+/** Embedding request for one or more text inputs. */
 export type LlmEmbedRequest<M extends string = string> = {
     model: M;
     input: string | readonly LlmEmbedInput[];
@@ -262,13 +252,7 @@ export type LlmEmbedRequest<M extends string = string> = {
     dimensions?: number;
 };
 
-/**
- * **Vectors of embedding request**: embedding vectors and execution statistics in input order.
- *
- * - `embeddings`: vector array matching input order
- * - `usage.inputTokens`: summed across batched provider calls
- * - `calls`: batched provider calls made; attempts: total calls including retries
- */
+/** Embedding vectors, token usage, and execution statistics in input order. */
 export type LlmEmbedOutput = {
     embeddings: number[][];
     name: string;
@@ -338,16 +322,12 @@ export type LlmError = {
  * - `native`: schema in provider setting read by model (Gemini, OpenAI)
  * - `strict`: strict schema with required properties and nullable optionals (Groq)
  * - `grammar`: decoding constraint alongside system prompt schema instruction (Ollama)
- * - `prompt`: prompt-injected schema instruction with answer verification retries (DeepSeek)
+ * - `prompt`: prompt-injected schema instruction only; no schema sent to provider (DeepSeek)
+ * - all modes: answer verified against schema; mismatch fails as `invalid_json` without retry
  */
 export type LlmJsonMode = 'native' | 'strict' | 'grammar' | 'prompt';
 
-/**
- * **Provider API capabilities**: features supported by provider adapter.
- *
- * - omitted members treated as unsupported
- * - models may only declare capabilities supported by adapter
- */
+/** Provider adapter capabilities; omitted members are treated as unsupported. */
 export type LlmProviderSupport = {
     images?: true;
     tools?: true;
@@ -358,15 +338,7 @@ export type LlmProviderSupport = {
     embeddings?: true;
 };
 
-/**
- * **Declared model capabilities**: capabilities and default behaviors declared in configuration.
- *
- * - `images`, `tools`: enables vision and function calling features
- * - `json`: JSON mode configuration (boolean or specific LlmJsonMode)
- * - `webSearch`, `batch`: search and batch execution support with optional defaults
- * - `reasoning`: supported effort levels and default reasoning effort
- * - `embeddings`: embedding generation with batch input limits
- */
+/** Declared model capabilities and default behaviors. */
 export type LlmModelCapabilities = {
     images?: boolean;
     tools?: boolean;
@@ -388,13 +360,7 @@ export type LlmCapabilities = {
     embeddings: { supported: boolean; maxInputs: number };
 };
 
-/**
- * **Adapter request payload**: normalized request prepared for provider adapter.
- *
- * - `model`: provider model ID with defaults merged and capabilities validated
- * - `max_tokens`: unified output limit (folds max_completion_tokens)
- * - `response_format` and `reasoning_effort`: mapped to adapter format
- */
+/** Normalized request payload prepared for a provider adapter. */
 export type LlmProviderRequest = Omit<LlmRequest, 'max_completion_tokens'>;
 
 /** Raw completion returned by provider adapter before core metadata enrichment. */
@@ -484,14 +450,7 @@ export type LlmLimiterOptions = {
     maxWaitMs?: number;
 };
 
-/**
- * **Model configuration**: model-specific parameters, limits, capabilities, and defaults.
- *
- * - `model`: provider model ID
- * - `modelLimits`: model-level concurrency and rate limits
- * - `capabilities`: declared features supported by model
- * - `charsPerToken`: model token estimation divisor override
- */
+/** Model-specific configuration for provider ID, defaults, limits, and capabilities. */
 export type LlmModelSpec = {
     model: string;
     defaults?: LlmDefaults;
@@ -511,14 +470,7 @@ export type LlmProviderSpec = {
     models: Readonly<Record<string, string | LlmModelSpec>>;
 };
 
-/**
- * **LLM configuration**: root configuration for createLlm.
- *
- * - `providers`: provider adapters and their mapped model configurations
- * - `defaults`: root default request parameters inherited by all calls
- * - `limiterOptions`: global retry and queue timeout settings
- * - `charsPerToken`: default character-to-token ratio for limit booking (default 4)
- */
+/** Root configuration for `createLlm`. */
 export type LlmConfig = {
     defaults?: LlmDefaults;
     limiterOptions?: LlmLimiterOptions;
@@ -534,21 +486,10 @@ export type LlmModelNames<C extends LlmConfig> = {
 /** Resolved model metadata and capabilities. */
 export type LlmModel = { name: string; provider: string; model: string; capabilities: LlmCapabilities };
 
-/**
- * **Model input formats**: valid input types for model shortcut functions.
- *
- * - string: single user message text
- * - content parts: single user message containing text and image parts
- * - messages: full multi-turn conversation history
- */
+/** Valid input formats for model shortcut functions: text string, content parts, or messages. */
 export type LlmModelInput = string | readonly LlmContentPart[] | readonly LlmMessage[];
 
-/**
- * **Model shortcut options**: request fields and call options for model shortcut calls.
- *
- * - excludes model and messages (provided by shortcut method and input)
- * - undefined values preserve configured defaults
- */
+/** Request fields and call options for model shortcut calls; `undefined` preserves defaults. */
 export type LlmModelOptions = {
     [K in keyof (Omit<LlmRequest, 'model' | 'messages'> & LlmCallOptions)]?:
         | (Omit<LlmRequest, 'model' | 'messages'> & LlmCallOptions)[K]
@@ -576,15 +517,7 @@ export type LlmReservedName =
     // biome-ignore lint/complexity/noBannedTypes: Object represents Object.prototype member names
     | keyof Object;
 
-/**
- * **LLM instance**: multi-provider coordinator with rate limits and model shortcut functions.
- *
- * - `generate`: sends chat completion through model and provider limit queues
- * - `embed`: generates embeddings split across batched provider calls
- * - `models`: list of configured models and resolved capabilities
- * - `listModels`: queries models available from provider API
- * - dynamic model methods: `llm[modelName](input, options)`
- */
+/** Multi-provider LLM instance with rate limits and model shortcut functions. */
 export type Llm<M extends string> = {
     generate(request: LlmRequest<M>, options?: LlmCallOptions): Promise<Result<LlmOutput, LlmError>>;
     embed(request: LlmEmbedRequest<M>, options?: { signal?: AbortSignal }): Promise<Result<LlmEmbedOutput, LlmError>>;

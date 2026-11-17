@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const pkg = require('@smart-llm/gemini');
 
 assert.equal(typeof pkg.createGeminiProvider, 'function');
+assert.equal(typeof pkg.GEMINI_API_KEY_ENV, 'string');
 assert.equal(pkg.GEMINI_SUPPORT.webSearch, true);
 
 const provider = pkg.createGeminiProvider({ apiKey: 'smoke-test-key' });

@@ -20,7 +20,7 @@ const SUPPORT_FLAGS = ['images', 'tools', 'webSearch', 'reasoning', 'batch', 'em
 /** Members of `LlmProviderSupport`. */
 const SUPPORT_KEYS: ReadonlySet<string> = new Set([...SUPPORT_FLAGS, 'json']);
 
-/** Members of `LlmModelCapabilities`, of its `webSearch` / `batch` and of its `reasoning`. */
+/** Allowed keys for capability configuration objects. */
 const CAPABILITY_KEYS: ReadonlySet<string> = new Set([
     'images',
     'tools',

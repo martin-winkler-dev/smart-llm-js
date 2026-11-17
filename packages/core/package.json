@@ -1,6 +1,6 @@
 {
   "name": "@smart-llm/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One OpenAI-form request for many LLM providers: named models, capabilities, JSON schema handling and smart-limit limits",
   "keywords": [],
   "author": "Martin Winkler",
@@ -49,6 +49,6 @@
     "test:package": "attw --pack . --profile esm-only"
   },
   "dependencies": {
-    "smart-limit": "^0.1.0"
+    "smart-limit": "^0.2.0"
   }
 }

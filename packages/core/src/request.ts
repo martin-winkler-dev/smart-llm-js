@@ -1,6 +1,7 @@
 // Copyright 2026 Martin Winkler
 // SPDX-License-Identifier: Apache-2.0
 
+import { IMAGE_DETAILS } from './images.js';
 import { cleanSchema, schemaInstruction, toStrictSchema } from './schema.js';
 import type {
     LlmCapabilities,
@@ -25,14 +26,12 @@ import type {
  * - `schema`: schema used to validate completion (`undefined` without `json_schema`)
  * - `json`: whether output must be valid JSON
  * - `strict`: whether optional null fields are stripped from completion
- * - `prompted`: whether schema was injected into prompt for retryable validation
  */
 export type PreparedRequest = {
     request: LlmProviderRequest;
     json: boolean;
     schema: LlmJsonSchema | undefined;
     strict: boolean;
-    prompted: boolean;
 };
 
 // -------------------------------------------------------------------
@@ -95,8 +94,23 @@ export const REASONING_EFFORTS: readonly LlmReasoningEffort[] = [
 /** Values of `reasoning_effort`. */
 const EFFORTS: ReadonlySet<string> = new Set<string>(REASONING_EFFORTS);
 
-/** Roles of `LlmMessage`. */
-const ROLES: ReadonlySet<string> = new Set(['system', 'developer', 'user', 'assistant', 'tool']);
+/** Members of `LlmMessage` by role; a role not listed is rejected. */
+const MESSAGE_KEYS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+    ['system', new Set(['role', 'content'])],
+    ['developer', new Set(['role', 'content'])],
+    ['user', new Set(['role', 'content'])],
+    ['assistant', new Set(['role', 'content', 'tool_calls', 'reasoning'])],
+    ['tool', new Set(['role', 'tool_call_id', 'content'])],
+]);
+
+/** Members of a text part. */
+const TEXT_PART_KEYS: ReadonlySet<string> = new Set(['type', 'text']);
+
+/** Members of an image part. */
+const IMAGE_PART_KEYS: ReadonlySet<string> = new Set(['type', 'image_url']);
+
+/** Members of an image part's `image_url`. */
+const IMAGE_URL_KEYS: ReadonlySet<string> = new Set(['url', 'detail']);
 
 /** Members of an `LlmTool`, its `function`, an `LlmToolCall` and its `function`. */
 const TOOL_KEYS: ReadonlySet<string> = new Set(['type', 'function']);
@@ -111,11 +125,36 @@ const TOOL_CHOICES: ReadonlySet<string> = new Set(['auto', 'none', 'required']);
 /** Tool function name pattern: up to 64 letters, digits, _ and -. */
 const MATCH_FUNCTION_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
-/** Types of `response_format`. */
-const FORMAT_TYPES: ReadonlySet<string> = new Set(['text', 'json_object', 'json_schema']);
+/** Members of `response_format` by type; a type not listed is rejected. */
+const FORMAT_KEYS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+    ['text', new Set(['type'])],
+    ['json_object', new Set(['type'])],
+    ['json_schema', new Set(['type', 'json_schema'])],
+]);
 
-/** Base64 data URL pattern of an image. */
-const MATCH_IMAGE_DATA_URL = /^data:image\/[\w.+-]+;base64,[A-Za-z0-9+/]*={0,2}$/;
+/** Members of `response_format.json_schema`. */
+const JSON_SCHEMA_KEYS: ReadonlySet<string> = new Set(['name', 'schema', 'description', 'strict']);
+
+/** Schema keywords holding one sub-schema; `items` may also hold an array (draft-07 tuple). */
+const SUB_SCHEMA_KEYS: ReadonlySet<string> = new Set([
+    'items',
+    'additionalProperties',
+    'not',
+    'contains',
+    'if',
+    'then',
+    'else',
+    'propertyNames',
+]);
+
+/** Schema keywords holding an array of sub-schemas. */
+const SUB_SCHEMA_LIST_KEYS: ReadonlySet<string> = new Set(['anyOf', 'oneOf', 'allOf', 'prefixItems']);
+
+/** Schema keywords holding a name-to-sub-schema map. */
+const SUB_SCHEMA_MAP_KEYS: ReadonlySet<string> = new Set(['properties', 'patternProperties', '$defs', 'definitions']);
+
+/** Base64 data URL pattern of an image; at least one base64 character. */
+const MATCH_IMAGE_DATA_URL = /^data:image\/[\w.+-]+;base64,[A-Za-z0-9+/]+={0,2}$/;
 
 /** Message fields that only one role takes. */
 const MESSAGE_FIELD_ROLES: readonly [field: string, role: string][] = [
@@ -132,10 +171,7 @@ const NUMBER_FIELDS = ['temperature', 'top_p', 'max_tokens', 'max_completion_tok
 // -------------------------------------------------------------------
 
 /**
- * **Validates request payload**: checks message history, parameters, and tools.
- *
- * - verifies required fields, role values, message contents, and tool call formats
- * - ensures numeric bounds, mutually exclusive token limits, and string formats
+ * Validates request payload structure, messages, parameters, and tools.
  * @throws {TypeError} If request structure or any field value is invalid.
  */
 export function validateRequest(request: unknown): asserts request is LlmRequest {
@@ -180,6 +216,8 @@ export function validateDefaults(defaults: unknown, option: string): asserts def
  *
  * - later layers override earlier ones
  * - folds `max_tokens` and `max_completion_tokens` into single limit
+ * - deep-copies plain values, so result shares no objects or arrays with caller request or stored defaults
+ * @throws {TypeError} If a field contains a circular reference.
  */
 export function applyDefaults(request: LlmRequest, ...defaults: (LlmDefaults | undefined)[]): LlmRequest {
     const filled: Record<string, unknown> = {};
@@ -193,7 +231,7 @@ export function applyDefaults(request: LlmRequest, ...defaults: (LlmDefaults | u
         }
         for (const [key, value] of Object.entries(layer)) {
             if (value !== undefined) {
-                filled[key] = value;
+                filled[key] = copyPlain(value, key);
             }
         }
     }
@@ -253,9 +291,11 @@ export function prepareRequest(
     }
     const format = request.response_format;
     if (format === undefined || format.type === 'text') {
+        // `text` is the default of every provider: not forwarded
+        delete prepared.response_format;
         return {
             ok: true,
-            data: { request: prepared, json: false, schema: undefined, strict: false, prompted: false },
+            data: { request: prepared, json: false, schema: undefined, strict: false },
         };
     }
     const mode = capabilities.json;
@@ -263,8 +303,7 @@ export function prepareRequest(
         return unsupported('JSON output');
     }
     const schema = format.type === 'json_schema' ? format.json_schema.schema : undefined;
-    const prompted = mode === 'prompt' || mode === 'grammar';
-    if (prompted) {
+    if (mode === 'prompt' || mode === 'grammar') {
         prepared.messages = withInstruction(request.messages, schemaInstruction(schema && cleanSchema(schema)));
     }
     if (format.type === 'json_schema' && schema !== undefined && mode !== 'prompt') {
@@ -278,10 +317,10 @@ export function prepareRequest(
                 ...(strict ? { strict: true } : {}),
             },
         };
-        return { ok: true, data: { request: prepared, json: true, schema, strict, prompted } };
+        return { ok: true, data: { request: prepared, json: true, schema, strict } };
     }
     prepared.response_format = { type: 'json_object' };
-    return { ok: true, data: { request: prepared, json: true, schema, strict: false, prompted } };
+    return { ok: true, data: { request: prepared, json: true, schema, strict: false } };
 }
 
 /**
@@ -333,18 +372,12 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Creates deep clone of plain objects and arrays, preserving other values. */
-export function copyPlain<T>(value: T): T {
-    if (Array.isArray(value)) {
-        return value.map(copyPlain) as T;
-    }
-    if (isPlainObject(value)) {
-        const prototype: unknown = Object.getPrototypeOf(value);
-        if (prototype === Object.prototype || prototype === null) {
-            return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, copyPlain(entry)])) as T;
-        }
-    }
-    return value;
+/**
+ * Creates deep clone of plain objects and arrays, preserving other values.
+ * @throws {TypeError} If value contains a circular reference, naming `option`.
+ */
+export function copyPlain<T>(value: T, option = 'options'): T {
+    return copyNode(value, option, new WeakSet()) as T;
 }
 
 // -------------------------------------------------------------------
@@ -352,11 +385,15 @@ export function copyPlain<T>(value: T): T {
 // -------------------------------------------------------------------
 
 /**
- * Validates message structure, role, and content parts.
+ * **Validates message structure, role, and content parts.**
+ *
+ * - keys per role; `tool_calls` and array `content` need at least one entry
+ * - parts: text, or base64 data URL image (with optional `detail`) in user messages
  * @throws {TypeError} If message structure or content is invalid.
  */
 function validateMessage(message: unknown, callIds: Set<string>): void {
-    if (!isPlainObject(message) || !ROLES.has(message.role as string)) {
+    const keys = isPlainObject(message) ? MESSAGE_KEYS.get(message.role as string) : undefined;
+    if (!isPlainObject(message) || keys === undefined) {
         throw new TypeError('Invalid value for option "messages"');
     }
     for (const [field, role] of MESSAGE_FIELD_ROLES) {
@@ -364,11 +401,12 @@ function validateMessage(message: unknown, callIds: Set<string>): void {
             throw new TypeError(`Invalid value for option "messages": ${field} only in ${role} messages`);
         }
     }
+    checkKeys(message, keys, 'messages.');
     const { content } = message;
     if (message.role === 'assistant') {
         const calls = message.tool_calls;
-        if (calls !== undefined && !Array.isArray(calls)) {
-            throw new TypeError('Invalid value for option "messages.tool_calls"');
+        if (calls !== undefined && (!Array.isArray(calls) || calls.length === 0)) {
+            throw new TypeError('Invalid value for option "messages.tool_calls": one or more tool calls');
         }
         for (const call of (calls ?? []) as unknown[]) {
             validateToolCall(call);
@@ -378,7 +416,7 @@ function validateMessage(message: unknown, callIds: Set<string>): void {
             throw new TypeError('Invalid value for option "messages.reasoning"');
         }
         if (content === null) {
-            if (calls === undefined || calls.length === 0) {
+            if (calls === undefined) {
                 throw new TypeError('Invalid value for option "messages": content null only with tool_calls');
             }
             return;
@@ -395,20 +433,40 @@ function validateMessage(message: unknown, callIds: Set<string>): void {
     if (!Array.isArray(content)) {
         throw new TypeError('Invalid value for option "messages"');
     }
+    if (content.length === 0) {
+        throw new TypeError('Invalid value for option "messages.content": a string or one or more parts');
+    }
     for (const part of content) {
-        if (part?.type === 'text' && typeof part.text === 'string') {
-            continue;
-        }
-        if (part?.type !== 'image_url') {
+        validatePart(part, message.role as string);
+    }
+}
+
+/**
+ * Validates content part: text, or image with base64 data URL and optional `detail` in user message.
+ * @throws {TypeError} If part type, keys, role, URL or detail is invalid.
+ */
+function validatePart(part: unknown, role: string): void {
+    if (!isPlainObject(part) || (part.type !== 'text' && part.type !== 'image_url')) {
+        throw new TypeError('Invalid value for option "messages"');
+    }
+    if (part.type === 'text') {
+        checkKeys(part, TEXT_PART_KEYS, 'messages.content.');
+        if (typeof part.text !== 'string') {
             throw new TypeError('Invalid value for option "messages"');
         }
-        if (message.role !== 'user') {
-            throw new TypeError('Invalid value for option "messages": images only in user messages');
-        }
-        const url = part.image_url?.url;
-        if (typeof url !== 'string' || !MATCH_IMAGE_DATA_URL.test(url)) {
-            throw new TypeError('Invalid value for option "messages": an image must be a base64 data URL');
-        }
+        return;
+    }
+    if (role !== 'user') {
+        throw new TypeError('Invalid value for option "messages": images only in user messages');
+    }
+    checkKeys(part, IMAGE_PART_KEYS, 'messages.content.');
+    const image = part.image_url;
+    if (!isPlainObject(image) || typeof image.url !== 'string' || !MATCH_IMAGE_DATA_URL.test(image.url)) {
+        throw new TypeError('Invalid value for option "messages": an image must be a base64 data URL');
+    }
+    checkKeys(image, IMAGE_URL_KEYS, 'messages.content.image_url.');
+    if (image.detail !== undefined && !IMAGE_DETAILS.has(image.detail)) {
+        throw new TypeError('Invalid value for option "messages.content.image_url.detail": auto, low or high');
     }
 }
 
@@ -474,8 +532,8 @@ function validateTools(fields: Record<string, unknown>): void {
             if (description !== undefined && typeof description !== 'string') {
                 throw new TypeError('Invalid value for option "tools.function.description"');
             }
-            if (parameters !== undefined && !isPlainObject(parameters)) {
-                throw new TypeError('Invalid value for option "tools.function.parameters": a JSON Schema object');
+            if (parameters !== undefined) {
+                validateSchemaShape(parameters, 'tools.function.parameters');
             }
             if (strict !== undefined && strict !== null && typeof strict !== 'boolean') {
                 throw new TypeError('Invalid value for option "tools.function.strict"');
@@ -551,19 +609,120 @@ function validateFields(fields: Record<string, unknown>, option: string): void {
     if (format === undefined) {
         return;
     }
-    if (!isPlainObject(format) || !FORMAT_TYPES.has(format.type as string)) {
+    const keys = isPlainObject(format) ? FORMAT_KEYS.get(format.type as string) : undefined;
+    if (keys === undefined) {
         throw new TypeError('Invalid value for option "response_format"');
     }
-    if (format.type === 'json_schema') {
-        const spec = format.json_schema;
-        if (
-            !isPlainObject(spec) ||
-            typeof spec.name !== 'string' ||
-            (spec.schema !== undefined && !isPlainObject(spec.schema))
-        ) {
-            throw new TypeError('Invalid value for option "response_format.json_schema"');
+    checkKeys(format, keys, 'response_format.');
+    if (format.type !== 'json_schema') {
+        return;
+    }
+    const spec = format.json_schema;
+    checkKeys(spec, JSON_SCHEMA_KEYS, 'response_format.json_schema.');
+    const { name, schema, description, strict } = spec as Record<string, unknown>;
+    if (typeof name !== 'string' || !MATCH_FUNCTION_NAME.test(name)) {
+        throw new TypeError(
+            'Invalid value for option "response_format.json_schema.name": up to 64 letters, digits, _ and -',
+        );
+    }
+    if (description !== undefined && typeof description !== 'string') {
+        throw new TypeError('Invalid value for option "response_format.json_schema.description"');
+    }
+    if (strict !== undefined && strict !== null && typeof strict !== 'boolean') {
+        throw new TypeError('Invalid value for option "response_format.json_schema.strict"');
+    }
+    if (schema !== undefined) {
+        validateSchemaShape(schema, 'response_format.json_schema.schema');
+    }
+}
+
+/**
+ * **Validates schema shape**: catches malformed sub-schemas before any API call; no full JSON Schema validation.
+ *
+ * - root: plain object; sub-schemas: plain object or boolean
+ * - single sub-schema keys: `items` (or array of them, draft-07 tuple), `additionalProperties`, `not`, `contains`, `if`/`then`/`else`, `propertyNames`
+ * - array keys: `anyOf`, `oneOf`, `allOf`, `prefixItems`; map keys: `properties`, `patternProperties`, `$defs`, `definitions`
+ * - no circular references; same sub-schema reused in separate branches allowed
+ * @throws {TypeError} If schema or one of these nodes is invalid, with the path of that node.
+ */
+function validateSchemaShape(schema: unknown, option: string): void {
+    if (!isPlainObject(schema)) {
+        throw new TypeError(`Invalid value for option "${option}": a JSON Schema object`);
+    }
+    checkSubSchema(schema, option, new WeakSet());
+}
+
+/**
+ * Validates sub-schema node and its nested sub-schemas recursively; `seen` holds nodes on current path.
+ * @throws {TypeError} If node or container is malformed, or node is cyclic.
+ */
+function checkSubSchema(schema: unknown, option: string, seen: WeakSet<object>): void {
+    if (typeof schema === 'boolean') {
+        return;
+    }
+    if (!isPlainObject(schema)) {
+        throw new TypeError(`Invalid value for option "${option}": a JSON Schema object or boolean`);
+    }
+    if (seen.has(schema)) {
+        throw new TypeError(`Invalid value for option "${option}": a JSON Schema without circular references`);
+    }
+    seen.add(schema);
+    for (const [key, value] of Object.entries(schema)) {
+        const path = `${option}.${key}`;
+        if (value === undefined) {
+            continue;
+        }
+        if (key === 'items' && Array.isArray(value)) {
+            checkSchemaList(value, path, seen);
+        } else if (SUB_SCHEMA_KEYS.has(key)) {
+            checkSubSchema(value, path, seen);
+        } else if (SUB_SCHEMA_LIST_KEYS.has(key)) {
+            if (!Array.isArray(value)) {
+                throw new TypeError(`Invalid value for option "${path}": an array of JSON Schemas`);
+            }
+            checkSchemaList(value, path, seen);
+        } else if (SUB_SCHEMA_MAP_KEYS.has(key)) {
+            if (!isPlainObject(value)) {
+                throw new TypeError(`Invalid value for option "${path}": an object of JSON Schemas`);
+            }
+            for (const [name, entry] of Object.entries(value)) {
+                checkSubSchema(entry, `${path}.${name}`, seen);
+            }
         }
     }
+    seen.delete(schema);
+}
+
+/**
+ * Validates each sub-schema of array container.
+ * @throws {TypeError} If entry is malformed or cyclic.
+ */
+function checkSchemaList(list: unknown[], option: string, seen: WeakSet<object>): void {
+    for (const [index, entry] of list.entries()) {
+        checkSubSchema(entry, `${option}.${index}`, seen);
+    }
+}
+
+/**
+ * Copies plain node recursively; `ancestors` holds the objects on the current path.
+ * @throws {TypeError} If node is its own ancestor.
+ */
+function copyNode(value: unknown, option: string, ancestors: WeakSet<object>): unknown {
+    const isArray = Array.isArray(value);
+    const prototype: unknown = isPlainObject(value) ? Object.getPrototypeOf(value) : undefined;
+    if (!isArray && prototype !== Object.prototype && prototype !== null) {
+        return value;
+    }
+    const node = value as object;
+    if (ancestors.has(node)) {
+        throw new TypeError(`Invalid value for option "${option}": a value without circular references`);
+    }
+    ancestors.add(node);
+    const copy = isArray
+        ? (value as unknown[]).map((entry) => copyNode(entry, option, ancestors))
+        : Object.fromEntries(Object.entries(node).map(([key, entry]) => [key, copyNode(entry, option, ancestors)]));
+    ancestors.delete(node);
+    return copy;
 }
 
 /** Injects system instruction immediately after leading system/developer messages. */

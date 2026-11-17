@@ -29,6 +29,9 @@ const LIMIT_KEYS: ReadonlySet<string> = new Set([
     'buckets',
 ]);
 
+/** Methods every smart-limit bucket has; `subscribe` is optional. */
+const BUCKET_METHODS = ['getWaitMs', 'reserve', 'settle'] as const;
+
 /** Integer limits (lowest value 1). */
 const INTEGER_LIMITS = ['concurrency', 'rps', 'rpm', 'rpd', 'tpm', 'tpd', 'intervalMs'] as const;
 
@@ -49,8 +52,11 @@ const DEFAULT_OUTPUT_TOKENS = 1000;
 // -------------------------------------------------------------------
 
 /**
- * Validates integer rate and token limits.
- * @throws {TypeError} If any limit is not an integer >= 1 or if buckets is not an array.
+ * **Validates integer rate and token limits and custom buckets.**
+ *
+ * - integer limits: >= 1
+ * - `buckets`: array of smart-limit buckets (`getWaitMs`, `reserve`, `settle`, optional `subscribe`), none with `configError`
+ * @throws {TypeError} If any limit or bucket is invalid, with the option path of the first invalid one.
  */
 export function validateLimits(limits: unknown, option: string): asserts limits is LlmLimits {
     checkKeys(limits, LIMIT_KEYS, `${option}.`);
@@ -63,6 +69,9 @@ export function validateLimits(limits: unknown, option: string): asserts limits 
     }
     if (values.buckets !== undefined && !Array.isArray(values.buckets)) {
         throw new TypeError(`Invalid value for option "${option}.buckets"`);
+    }
+    for (const [index, bucket] of (values.buckets ?? []).entries()) {
+        validateBucket(bucket, `${option}.buckets.${index}`);
     }
 }
 
@@ -99,10 +108,7 @@ export function validateCharsPerToken(charsPerToken: unknown, option: string): n
 }
 
 /**
- * **Creates smart-limit buckets**: instantiates rate and concurrency limits.
- *
- * - instantiates concurrency, sliding window, and quota buckets
- * - excludes concurrency when handled by model queue
+ * Creates smart-limit buckets for configured limits, optionally excluding concurrency.
  * @throws {TypeError} If bucket configuration is invalid.
  */
 export function createLimitBuckets(given: LlmLimits | undefined, option: string, withConcurrency: boolean): Bucket[] {
@@ -157,4 +163,42 @@ export function estimateTokens(request: LlmProviderRequest, charsPerToken: numbe
         }
     }
     return Math.ceil(chars / charsPerToken) + images * IMAGE_TOKENS + (request.max_tokens ?? DEFAULT_OUTPUT_TOKENS);
+}
+
+// -------------------------------------------------------------------
+// --- 3. Private Functions
+// -------------------------------------------------------------------
+
+/**
+ * Validates custom bucket like smart-limit does when creating a queue.
+ * @throws {TypeError} If bucket lacks a method, has a non-function `subscribe`, carries a `configError`, or a
+ * property read throws.
+ */
+function validateBucket(bucket: unknown, option: string): void {
+    const invalid = `Invalid value for option "${option}": a smart-limit bucket with ${BUCKET_METHODS.join(', ')}`;
+    if (typeof bucket !== 'object' || bucket === null) {
+        throw new TypeError(invalid);
+    }
+    const value = bucket as Record<string, unknown>;
+    let hasMethods: boolean;
+    let subscribe: unknown;
+    let reason: string | undefined;
+    try {
+        hasMethods = BUCKET_METHODS.every((name) => typeof value[name] === 'function');
+        subscribe = value.subscribe;
+        const { configError } = value as { configError?: { cause?: unknown } };
+        reason = configError ? String(configError.cause) : undefined;
+    } catch {
+        // a throwing getter or `toString` is reported like a missing method
+        hasMethods = false;
+    }
+    if (!hasMethods) {
+        throw new TypeError(invalid);
+    }
+    if (subscribe !== undefined && typeof subscribe !== 'function') {
+        throw new TypeError(`Invalid value for option "${option}.subscribe": a function`);
+    }
+    if (reason !== undefined) {
+        throw new TypeError(`Invalid value for option "${option}": ${reason}`);
+    }
 }

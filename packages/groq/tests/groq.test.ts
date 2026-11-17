@@ -11,6 +11,39 @@ import {
 } from '@smart-llm/core';
 import { createGroqProvider, GROQ_SUPPORT } from '../src/index.js';
 
+// -------------------------------------------------------------------
+// --- 1. Constants
+// -------------------------------------------------------------------
+
+const call = { signal: new AbortController().signal, extra: {} };
+
+const format: LlmResponseFormat = {
+    type: 'json_schema',
+    json_schema: {
+        name: 'word',
+        schema: { type: 'object', properties: { kind: { type: 'string' } }, required: ['kind'] },
+    },
+};
+
+const names = { name: 'oss', provider: 'groq' };
+
+const settings: LlmSettings = {
+    ...names,
+    model: 'openai/gpt-oss-20b',
+    temperature: 0.5,
+    seed: 3,
+    max_tokens: 200,
+    reasoning_effort: 'low',
+    jsonMode: 'strict',
+    extra: { reasoning_format: 'parsed' },
+};
+
+const options = { response_format: format, reasoning_effort: 'minimal' } as const;
+
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
+
 /** Creates fake fetch recording requests and answering with "ok". */
 function fakeFetch(): { fetch: typeof fetch; bodies: Record<string, unknown>[]; urls: string[] } {
     const bodies: Record<string, unknown>[] = [];
@@ -23,8 +56,6 @@ function fakeFetch(): { fetch: typeof fetch; bodies: Record<string, unknown>[]; 
     return { fetch: fetcher as typeof fetch, bodies, urls };
 }
 
-const call = { signal: new AbortController().signal, extra: {} };
-
 /** Formats test provider request with optional reasoning effort. */
 function request(model: string, effort?: LlmReasoningEffort): LlmProviderRequest {
     return {
@@ -34,32 +65,6 @@ function request(model: string, effort?: LlmReasoningEffort): LlmProviderRequest
         ...(effort === undefined ? {} : { reasoning_effort: effort }),
     };
 }
-
-describe('createGroqProvider', () => {
-    it('throws without an API key and reads it from env', () => {
-        expect(() => createGroqProvider({ env: {} })).toThrow(/GROQ_API_KEY/);
-        expect(createGroqProvider({ env: { GROQ_API_KEY: 'k' } }).name).toBe('groq');
-    });
-
-    it('sends reasoning_effort as it is, max_completion_tokens, and extra such as reasoning_format', async () => {
-        const fake = fakeFetch();
-        const groq = createGroqProvider({ apiKey: 'k', fetch: fake.fetch });
-        await groq.generate(request('openai/gpt-oss-20b', 'high'), call);
-        await groq.generate(request('qwen/qwen3.8-27b', 'none'), { ...call, extra: { reasoning_format: 'parsed' } });
-        await groq.generate(request('llama-3.3-70b-versatile'), call);
-        expect(fake.urls[0]).toBe('https://api.groq.com/openai/v1/chat/completions');
-        expect(fake.bodies[0]).toMatchObject({ reasoning_effort: 'high', max_completion_tokens: 10 });
-        expect(fake.bodies[0]?.max_tokens).toBeUndefined();
-        expect(fake.bodies[0]?.reasoning_format).toBeUndefined();
-        expect(fake.bodies[1]).toMatchObject({ reasoning_effort: 'none', reasoning_format: 'parsed' });
-        expect(fake.bodies[2]?.reasoning_effort).toBeUndefined();
-    });
-
-    it('supports images, tools, reasoning and strict JSON schemas', () => {
-        expect(GROQ_SUPPORT).toEqual({ images: true, tools: true, reasoning: true, json: 'strict' });
-        expect(createGroqProvider({ apiKey: 'k' }).supports).toEqual(GROQ_SUPPORT);
-    });
-});
 
 /** Creates fake queued fetch implementation recording request bodies. */
 function queueFetch(...answers: (() => Response)[]): { fetch: typeof fetch; bodies: Record<string, unknown>[] } {
@@ -106,29 +111,6 @@ function groqLlm(...answers: (() => Response)[]) {
     return { llm, bodies: fake.bodies };
 }
 
-const format: LlmResponseFormat = {
-    type: 'json_schema',
-    json_schema: {
-        name: 'word',
-        schema: { type: 'object', properties: { kind: { type: 'string' } }, required: ['kind'] },
-    },
-};
-
-const names = { name: 'oss', provider: 'groq' };
-
-const settings: LlmSettings = {
-    ...names,
-    model: 'openai/gpt-oss-20b',
-    temperature: 0.5,
-    seed: 3,
-    max_tokens: 200,
-    reasoning_effort: 'low',
-    jsonMode: 'strict',
-    extra: { reasoning_format: 'parsed' },
-};
-
-const options = { response_format: format, reasoning_effort: 'minimal' } as const;
-
 /** Returns mock response simulating `json_validate_failed` schema error. */
 function failedGeneration(): Response {
     return new Response(
@@ -143,7 +125,48 @@ function failedGeneration(): Response {
     );
 }
 
-describe('Groq through createLlm: settings, attempts and the answer of failed calls', () => {
+describe('createGroqProvider', () => {
+    it('throws without an API key and reads it from env', () => {
+        expect(() => createGroqProvider({ env: {} })).toThrow(/GROQ_API_KEY/);
+        expect(createGroqProvider({ env: { GROQ_API_KEY: 'k' } }).name).toBe('groq');
+    });
+
+    it('forwards reasoning_effort, maps max_completion_tokens, and passes extra', async () => {
+        const fake = fakeFetch();
+        const groq = createGroqProvider({ apiKey: 'k', fetch: fake.fetch });
+        await groq.generate(request('openai/gpt-oss-20b', 'high'), call);
+        await groq.generate(request('qwen/qwen3.8-27b', 'none'), { ...call, extra: { reasoning_format: 'parsed' } });
+        await groq.generate(request('llama-3.3-70b-versatile'), call);
+        expect(fake.urls[0]).toBe('https://api.groq.com/openai/v1/chat/completions');
+        expect(fake.bodies[0]).toMatchObject({ reasoning_effort: 'high', max_completion_tokens: 10 });
+        expect(fake.bodies[0]?.max_tokens).toBeUndefined();
+        expect(fake.bodies[0]?.reasoning_format).toBeUndefined();
+        expect(fake.bodies[1]).toMatchObject({ reasoning_effort: 'none', reasoning_format: 'parsed' });
+        expect(fake.bodies[2]?.reasoning_effort).toBeUndefined();
+    });
+
+    it('supports images, tools, reasoning and strict JSON schemas', () => {
+        expect(GROQ_SUPPORT).toEqual({ images: true, tools: true, reasoning: true, json: 'strict' });
+        expect(createGroqProvider({ apiKey: 'k' }).supports).toEqual(GROQ_SUPPORT);
+    });
+
+    it('snapshots GROQ_SUPPORT at provider creation', async () => {
+        const fake = fakeFetch();
+        const groq = createGroqProvider({ apiKey: 'k', fetch: fake.fetch });
+        const support = GROQ_SUPPORT as { embeddings?: true };
+        support.embeddings = true;
+        try {
+            const result = await groq.embed?.({ model: 'm', input: [{ text: 'a' }] }, { signal: call.signal });
+            expect(result).toMatchObject({ ok: false, error: { code: 'unsupported' } });
+            expect(groq.supports.embeddings).toBeUndefined();
+            expect(fake.urls).toHaveLength(0);
+        } finally {
+            delete support.embeddings;
+        }
+    });
+});
+
+describe('Groq through createLlm', () => {
     it('reports the settings with the effort mapped to the model levels and one attempt', async () => {
         const { llm, bodies } = groqLlm(reply('{"kind":"noun"}'));
         const result = await llm.oss('word?', options);
@@ -165,7 +188,7 @@ describe('Groq through createLlm: settings, attempts and the answer of failed ca
         expect(bodies[0]).toMatchObject({ reasoning_effort: 'low', max_completion_tokens: 200 });
     });
 
-    it('does not retry a schema mismatch in strict mode and puts the answer with reasoning and json on it', async () => {
+    it('attaches output with reasoning and json on strict schema mismatch without retry', async () => {
         const { llm, bodies } = groqLlm(reply('{"kind":1}'));
         const result = await llm.oss('word?', options);
         expect(result).toMatchObject({
@@ -185,12 +208,20 @@ describe('Groq through createLlm: settings, attempts and the answer of failed ca
         expect(bodies).toHaveLength(1);
     });
 
-    it('retries json_validate_failed and puts the failed generation on the error as output', async () => {
+    it('maps json_validate_failed to invalid_json with failed_generation as output', async () => {
         const { llm, bodies } = groqLlm(failedGeneration);
         const result = await llm.oss('word?', options);
         expect(result).toMatchObject({
             ok: false,
-            error: { code: 'invalid_json', status: 400, text: '{"kind":', ...names, settings, attempts: 2 },
+            error: {
+                code: 'invalid_json',
+                status: 400,
+                retryable: false,
+                text: '{"kind":',
+                ...names,
+                settings,
+                attempts: 1,
+            },
         });
         expect(result.ok ? undefined : result.error.output).toEqual({
             text: '{"kind":',
@@ -200,9 +231,7 @@ describe('Groq through createLlm: settings, attempts and the answer of failed ca
             ms: expect.any(Number),
             ...names,
         });
-        expect(bodies).toHaveLength(2);
-        const recovered = await groqLlm(failedGeneration, reply('{"kind":"verb"}')).llm.oss('word?', options);
-        expect(recovered).toMatchObject({ ok: true, data: { json: { kind: 'verb' }, attempts: 2 } });
+        expect(bodies).toHaveLength(1);
     });
 
     it('puts the answer with reasoning on truncated and blocked errors after one attempt', async () => {

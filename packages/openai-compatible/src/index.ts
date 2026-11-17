@@ -49,28 +49,8 @@ export type OpenAiCompatibleOptions = {
     fetch?: typeof fetch;
 };
 
-/** Chat completion response structure read by adapter. */
-type ChatCompletion = {
-    model?: string;
-    choices?: {
-        // biome-ignore lint/style/useNamingConvention: OpenAI field name
-        finish_reason?: string | null;
-        message?: {
-            content?: string | null;
-            // biome-ignore lint/style/useNamingConvention: OpenAI field name
-            tool_calls?: unknown;
-            [field: string]: unknown;
-        };
-    }[];
-    usage?: {
-        // biome-ignore lint/style/useNamingConvention: OpenAI field name
-        prompt_tokens?: number;
-        // biome-ignore lint/style/useNamingConvention: OpenAI field name
-        completion_tokens?: number;
-        // biome-ignore lint/style/useNamingConvention: OpenAI field name
-        completion_tokens_details?: { reasoning_tokens?: number };
-    };
-};
+/** Chat completion response read by adapter; fields unchecked until validated. */
+type ChatCompletion = { model?: unknown; choices?: unknown; usage?: unknown };
 
 // -------------------------------------------------------------------
 // --- 2. Constants
@@ -117,6 +97,7 @@ const MATCH_TRAILING_SLASHES = /\/+$/;
  * - deducts reasoning tokens from total completion tokens in reported usage
  * - executes batch `/embeddings` requests and sorts vectors by input index
  * - captures failures into structured `LlmError` results without throwing
+ * - snapshots `options` at creation; later mutations have no effect
  */
 export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions): LlmProvider {
     const baseUrl = options.baseUrl.replace(MATCH_TRAILING_SLASHES, '');
@@ -127,24 +108,23 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
         ...options.headers,
     };
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const reasoningFields = options.reasoningFields ?? DEFAULT_REASONING_FIELDS;
+    const { name, reasoningMessageField } = options;
+    const maxTokensField = options.maxTokensField ?? 'max_completion_tokens';
+    const mapBody = options.mapBody?.bind(options);
+    const reasoningFields = [...(options.reasoningFields ?? DEFAULT_REASONING_FIELDS)];
+    const embeddings = options.supports?.embeddings === true;
     return {
-        name: options.name,
+        name,
         supports: openAiCompatibleSupport(options.supports),
         async generate(request, { signal, extra }) {
             const missing = request.batch === true ? 'batch calls' : request.web_search === true ? 'web search' : '';
             if (missing !== '') {
-                const message = `${options.name} does not support ${missing}`;
+                const message = `${name} does not support ${missing}`;
                 return { ok: false, error: { code: 'unsupported', message, retryable: false } };
             }
             try {
-                const body = toBody(
-                    request,
-                    options.maxTokensField ?? 'max_completion_tokens',
-                    options.reasoningMessageField,
-                    extra,
-                );
-                const finalBody = options.mapBody === undefined ? body : options.mapBody(body, request);
+                const body = toBody(request, maxTokensField, reasoningMessageField, extra);
+                const finalBody = mapBody === undefined ? body : mapBody(body, request);
                 const startedAt = performance.now();
                 const sent = await fetchJson(fetcher, `${baseUrl}/chat/completions`, {
                     method: 'POST',
@@ -153,7 +133,8 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
                     signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
                 });
                 if (!sent.ok) {
-                    return withFailedGeneration(sent.error, request.model, performance.now() - startedAt);
+                    const error = callerAbortError(sent.error, signal);
+                    return withFailedGeneration(error, request.model, performance.now() - startedAt);
                 }
                 return readCompletion(
                     (isRecord(sent.data) ? sent.data : {}) as ChatCompletion,
@@ -166,12 +147,12 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
             }
         },
         async embed(request, { signal }) {
-            if (options.supports?.embeddings !== true) {
-                const message = `${options.name} does not support embeddings`;
+            if (!embeddings) {
+                const message = `${name} does not support embeddings`;
                 return { ok: false, error: { code: 'unsupported', message, retryable: false } };
             }
             if (request.task !== undefined || request.input.some((input) => input.title !== undefined)) {
-                const message = `${options.name} embeddings take no task or title`;
+                const message = `${name} embeddings take no task or title`;
                 return { ok: false, error: { code: 'unsupported', message, retryable: false } };
             }
             try {
@@ -188,7 +169,8 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
                     signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
                 });
                 if (!sent.ok) {
-                    return { ok: false, error: { ...sent.error, ms: Math.round(performance.now() - startedAt) } };
+                    const error = callerAbortError(sent.error, signal);
+                    return { ok: false, error: { ...error, ms: Math.round(performance.now() - startedAt) } };
                 }
                 return readEmbeddings(sent.data, request, Math.round(performance.now() - startedAt));
             } catch (error) {
@@ -203,7 +185,7 @@ export function createOpenAiCompatibleProvider(options: OpenAiCompatibleOptions)
                     signal: listOptions.signal === undefined ? timeout : AbortSignal.any([listOptions.signal, timeout]),
                 });
                 if (!sent.ok) {
-                    return sent;
+                    return { ok: false, error: callerAbortError(sent.error, listOptions.signal) };
                 }
                 const data = isRecord(sent.data) ? sent.data.data : undefined;
                 const models: LlmModelInfo[] = (Array.isArray(data) ? data : []).flatMap((model: unknown) =>
@@ -266,7 +248,7 @@ export async function fetchJson(
         const message =
             body.message === undefined ? `HTTP ${response.status}` : `HTTP ${response.status}: ${body.message}`;
         if (body.code === JSON_FAILED_CODE) {
-            const error: LlmError = { code: 'invalid_json', message, retryable: true, status: response.status };
+            const error: LlmError = { code: 'invalid_json', message, retryable: false, status: response.status };
             if (body.failedGeneration !== undefined) {
                 error.text = body.failedGeneration;
             }
@@ -283,6 +265,16 @@ export async function fetchJson(
     } catch {
         return { ok: false, error: { code: 'unexpected', message: 'The response is not JSON', retryable: false } };
     }
+}
+
+/**
+ * Reports `fetchJson` `timeout` as `aborted` when caller `signal` fired (not internal `timeoutMs`).
+ * @internal - shared with provider packages; not public API
+ */
+export function callerAbortError(error: LlmError, signal: AbortSignal | undefined): LlmError {
+    return error.code === 'timeout' && signal?.aborted === true
+        ? { ...error, code: 'aborted', retryable: false }
+        : error;
 }
 
 // -------------------------------------------------------------------
@@ -322,11 +314,14 @@ function toBodyMessage(message: LlmMessage, reasoningMessageField: string | unde
     const { reasoning, tool_calls: calls, ...rest } = message;
     return {
         ...rest,
-        ...(calls === undefined
+        ...(calls === undefined || calls.length === 0
             ? {}
             : {
                   // biome-ignore lint/style/useNamingConvention: OpenAI field name
-                  tool_calls: calls.map(({ extra_content: _extra, ...call }) => call),
+                  tool_calls: calls.map(({ extra_content: _extra, ...call }) => ({
+                      ...call,
+                      function: { ...call.function, arguments: call.function.arguments || '{}' },
+                  })),
               }),
         ...(reasoning === undefined || reasoningMessageField === undefined
             ? {}
@@ -334,14 +329,14 @@ function toBodyMessage(message: LlmMessage, reasoningMessageField: string | unde
     };
 }
 
-/** Extracts tool calls from message, generating missing IDs and serializing arguments. */
+/** Extracts tool calls with non-empty names, generating missing IDs and serializing arguments (`""` as `'{}'`). */
 function readToolCalls(calls: unknown): LlmToolCall[] {
     if (!Array.isArray(calls)) {
         return [];
     }
     return calls.flatMap((call: { id?: unknown; function?: { name?: unknown; arguments?: unknown } } | null) => {
         const name = call?.function?.name;
-        if (typeof name !== 'string') {
+        if (typeof name !== 'string' || name === '') {
             return [];
         }
         const args = call?.function?.arguments;
@@ -352,7 +347,7 @@ function readToolCalls(calls: unknown): LlmToolCall[] {
                         ? call.id
                         : `call_${randomUUID().replaceAll('-', '')}`,
                 type: 'function' as const,
-                function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) },
+                function: { name, arguments: typeof args === 'string' ? args || '{}' : JSON.stringify(args ?? {}) },
             },
         ];
     });
@@ -416,7 +411,7 @@ function readEmbeddings(
         data: {
             embeddings: vectors as number[][],
             model: typeof record.model === 'string' && record.model !== '' ? record.model : request.model,
-            usage: { inputTokens: typeof tokens === 'number' ? tokens : null },
+            usage: { inputTokens: readCount(tokens) },
             ms,
         },
     };
@@ -464,39 +459,39 @@ function readCompletion(
     reasoningFields: readonly string[],
     ms: number,
 ): Result<LlmProviderOutput, LlmProviderError> {
-    const choice = completion.choices?.[0];
-    const message = choice?.message;
-    const usage = completion.usage;
-    const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens ?? null;
-    const completionTokens = usage?.completion_tokens ?? null;
+    const choice: unknown = Array.isArray(completion.choices) ? completion.choices[0] : undefined;
+    const message: unknown = isRecord(choice) ? choice.message : undefined;
+    if (!isRecord(choice) || !isRecord(message)) {
+        return { ok: false, error: { code: 'unexpected', message: 'The response has no choice', retryable: false } };
+    }
+    const usage = isRecord(completion.usage) ? completion.usage : {};
+    const details = isRecord(usage.completion_tokens_details) ? usage.completion_tokens_details : {};
+    const reasoningTokens = readCount(details.reasoning_tokens);
+    const completionTokens = readCount(usage.completion_tokens);
     const output: LlmProviderOutput = {
-        text: typeof message?.content === 'string' ? message.content : '',
-        model: completion.model ?? requestedModel,
+        text: typeof message.content === 'string' ? message.content : '',
+        model: typeof completion.model === 'string' && completion.model !== '' ? completion.model : requestedModel,
         usage: {
-            inputTokens: usage?.prompt_tokens ?? null,
-            outputTokens: completionTokens === null ? null : completionTokens - (reasoningTokens ?? 0),
+            inputTokens: readCount(usage.prompt_tokens),
+            outputTokens: completionTokens === null ? null : Math.max(0, completionTokens - (reasoningTokens ?? 0)),
             reasoningTokens,
         },
-        finishReason: choice?.finish_reason ?? null,
+        finishReason: typeof choice.finish_reason === 'string' ? choice.finish_reason : null,
         ms: Math.round(ms),
     };
     const reasoning = reasoningFields
-        .map((field) => message?.[field])
+        .map((field) => message[field])
         .find((value) => typeof value === 'string' && value !== '');
     if (typeof reasoning === 'string') {
         output.reasoning = reasoning;
     }
-    const toolCalls = readToolCalls(message?.tool_calls);
+    const toolCalls = readToolCalls(message.tool_calls);
     if (toolCalls.length > 0) {
         output.toolCalls = toolCalls;
-    }
-    if (choice === undefined || message === undefined) {
-        return { ok: false, error: { code: 'unexpected', message: 'The response has no choice', retryable: false } };
     }
     const reason = output.finishReason;
     const answered = { text: output.text, model: output.model, usage: output.usage, ms: output.ms, output };
     if (reason === 'tool_calls' && toolCalls.length === 0) {
-        // Missing tool name: unusable response
         return {
             ok: false,
             error: {
@@ -554,6 +549,11 @@ function readCompletion(
             ...answered,
         },
     };
+}
+
+/** Reads token count; `null` unless finite number `>= 0`. */
+function readCount(value: unknown): number | null {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 /** Checks whether text is valid JSON object. */

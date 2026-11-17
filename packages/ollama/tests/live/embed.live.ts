@@ -8,6 +8,10 @@ import { describe, expect, it } from 'bun:test';
 import { createLlm } from '@smart-llm/core';
 import { createOllamaProvider, fetchOllamaCapabilities } from '../../src/index.js';
 
+// -------------------------------------------------------------------
+// --- 1. Constants
+// -------------------------------------------------------------------
+
 /** Embedding model name (requires `ollama pull bge-m3`). */
 const MODEL = 'bge-m3';
 
@@ -40,6 +44,10 @@ const llm = createLlm({
     },
 });
 
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
+
 /** Computes cosine similarity between two numeric vectors. */
 function cosine(a: number[], b: number[]): number {
     let dot = 0;
@@ -59,7 +67,7 @@ describe('Ollama embeddings (live, bge-m3)', () => {
         expect(capabilities.ok && capabilities.data[`${MODEL}:latest`]).toEqual({ embeddings: true });
     });
 
-    it('returns normalized 1024-dimensional vectors, the query closest to its answer', async () => {
+    it('returns normalized 1024d vectors with query closest to matching document', async () => {
         const documents = await llm.embed({ model: 'bge', input: DOCUMENTS });
         const query = await llm.embed({ model: 'bge', input: QUERY });
         expect(documents.ok && query.ok).toBe(true);
@@ -77,7 +85,7 @@ describe('Ollama embeddings (live, bge-m3)', () => {
         expect(scores.indexOf(Math.max(...scores))).toBe(1);
     });
 
-    it('embeds 150 texts in batches of 64 with the same vectors as one text per call', async () => {
+    it('matches single-input vectors when batching 150 texts in groups of 64', async () => {
         let started = performance.now();
         const batched = await llm.embed({ model: 'bge', input: MANY });
         const batchedMs = performance.now() - started;

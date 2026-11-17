@@ -29,7 +29,10 @@
     "test": "bun run build && bun test --only-failures && bun run test:types",
     "test:types": "tsc --noEmit -p tsconfig.test.json",
     "test:live:ollama": "bun test --timeout 120000 ./packages/ollama/tests/live/embed.live.ts",
-    "test:live:gemini": "bun test --timeout 60000 --env-file ../smart-genai/.env ./packages/gemini/tests/live/embed.live.ts",
+    "test:live:gemini": "bun test --timeout 240000 --env-file .env ./packages/gemini/tests/live/embed.live.ts ./packages/gemini/tests/live/generate.live.ts",
+    "test:live:anthropic": "bun test --timeout 120000 --env-file .env ./packages/anthropic/tests/live/messages.live.ts",
+    "test:live:anthropic:batch": "bun test --timeout 660000 --env-file .env ./packages/anthropic/tests/live/batch.live.ts",
+    "test:live:deepseek": "bun test --timeout 120000 --env-file .env ./packages/deepseek/tests/live/chat.live.ts",
     "test:dist": "bun run --filter \"@smart-llm/*\" test:dist",
     "test:package": "bun run --filter \"@smart-llm/*\" test:package",
     "coverage": "bun test --coverage",
@@ -39,6 +42,7 @@
     "check": "bun run lint:ci && bun run build && bun run test:types && bun test --only-failures && bun run test:dist && bun run test:package"
   },
   "devDependencies": {
+    "@smart-llm/anthropic": "workspace:*",
     "@smart-llm/core": "workspace:*",
     "@smart-llm/deepseek": "workspace:*",
     "@smart-llm/gemini": "workspace:*",

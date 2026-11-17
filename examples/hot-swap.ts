@@ -5,15 +5,23 @@
 // One configuration with Gemini, DeepSeek, Groq and a local Ollama model, and the same request sent to each.
 // Run: bun examples/hot-swap.ts (keys from env GEMINI_API_KEY, DEEPSEEK_API_KEY, GROQ_API_KEY; Ollama on localhost)
 
+import { fileURLToPath } from 'node:url';
 import { createLlm, imageFromFile, type LlmResponseFormat } from '@smart-llm/core';
-import { createDeepseekProvider } from '@smart-llm/deepseek';
-import { createGeminiProvider } from '@smart-llm/gemini';
-import { createGroqProvider } from '@smart-llm/groq';
+import { createDeepseekProvider, DEEPSEEK_API_KEY_ENV } from '@smart-llm/deepseek';
+import { createGeminiProvider, GEMINI_API_KEY_ENV } from '@smart-llm/gemini';
+import { createGroqProvider, GROQ_API_KEY_ENV } from '@smart-llm/groq';
 import { createOllamaProvider } from '@smart-llm/ollama';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
 // -------------------------------------------------------------------
+
+/** API key env variables not set; provider factories throw without them. */
+const missingKeys = [GEMINI_API_KEY_ENV, DEEPSEEK_API_KEY_ENV, GROQ_API_KEY_ENV].filter((name) => !process.env[name]);
+if (missingKeys.length > 0) {
+    console.error(`Missing env variables: ${missingKeys.join(', ')}`);
+    process.exit(1);
+}
 
 /** Multi-provider LLM instance configured with Gemini, DeepSeek, Groq, and Ollama. */
 const llm = createLlm({
@@ -115,7 +123,9 @@ async function main(): Promise<void> {
     }
 
     // Unsupported capabilities are rejected before request transmission
-    const photo = await imageFromFile('examples/photo.jpg');
+    const photo = await imageFromFile(
+        fileURLToPath(new URL('../packages/core/tests/fixtures/word-pelican.png', import.meta.url)),
+    );
     for (const model of ['flash', 'qwen'] as const) {
         const result = await llm.generate({
             model,

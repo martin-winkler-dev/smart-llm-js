@@ -4,7 +4,37 @@
 import { describe, expect, it } from 'bun:test';
 import { createLlm, type LlmSettings } from '@smart-llm/core';
 import type { GenaiCallOptions, GenaiClient, GenaiEmbedRequest, GenaiRequest } from 'smart-genai';
-import { createGeminiProvider, GEMINI_SUPPORT } from '../src/index.js';
+import {
+    createGeminiProvider,
+    GEMINI_API_KEY_ENV,
+    GEMINI_SUPPORT,
+    type GeminiExtra,
+    type GeminiOptions,
+} from '../src/index.js';
+
+// -------------------------------------------------------------------
+// --- 1. Constants
+// -------------------------------------------------------------------
+
+const call = { signal: new AbortController().signal, extra: {} };
+
+const format = {
+    type: 'json_schema' as const,
+    json_schema: { name: 'a', schema: { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] } },
+};
+
+const settings: LlmSettings = {
+    name: 'flash',
+    provider: 'gemini',
+    model: 'gemini-3.8-flash',
+    temperature: 0,
+    jsonMode: 'native',
+    extra: { config: { safetySettings: [], thinkingConfig: { includeThoughts: true, thinkingBudget: 128 } } },
+};
+
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
 
 /** Creates fake smart-genai client recording calls and returning mock data. */
 function fakeClient(): GenaiClient & {
@@ -38,6 +68,9 @@ function fakeClient(): GenaiClient & {
                 },
             };
         },
+        async decide() {
+            return { ok: false, error: { code: 'unsupported', message: 'no decide', retryable: false } };
+        },
         async listModels() {
             return {
                 ok: true,
@@ -47,7 +80,25 @@ function fakeClient(): GenaiClient & {
     };
 }
 
-const call = { signal: new AbortController().signal, extra: {} };
+/** Creates LLM instance with Gemini flash model for response/error tests. */
+function geminiLlm(client: GenaiClient) {
+    return createLlm({
+        defaults: { temperature: 0 },
+        providers: {
+            gemini: {
+                adapter: createGeminiProvider(client),
+                extra: { config: { safetySettings: [] } },
+                models: {
+                    flash: {
+                        model: 'gemini-3.8-flash',
+                        extra: { config: { thinkingConfig: { includeThoughts: true } } },
+                        capabilities: { json: true },
+                    },
+                },
+            },
+        },
+    });
+}
 
 describe('createGeminiProvider', () => {
     it('passes the request and extra.config to smart-genai and leaves json to createLlm', async () => {
@@ -132,7 +183,7 @@ describe('createGeminiProvider', () => {
         expect(() => gemini.validateExtra?.({ config: { httpOptions: {} } }, 'extra')).toThrow(/extra\.config/);
     });
 
-    it('merges config per field across provider, model and call, thinkingConfig per member', async () => {
+    it('merges config across layers and thinkingConfig per member', async () => {
         const client = fakeClient();
         const safetySettings = [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }];
         const llm = createLlm({
@@ -161,6 +212,71 @@ describe('createGeminiProvider', () => {
         } as never);
         const gemini = createGeminiProvider(fakeClient());
         expect(gemini.mergeExtra?.([{}, {}, {}])).toEqual({});
+    });
+
+    it('lets the call thinkingLevel replace the provider thinkingBudget through createLlm', async () => {
+        const client = fakeClient();
+        const llm = createLlm({
+            providers: {
+                gemini: {
+                    adapter: createGeminiProvider(client),
+                    extra: { config: { thinkingConfig: { thinkingBudget: 1024 } } },
+                    models: {
+                        flash: {
+                            model: 'gemini-3.8-flash',
+                            extra: { config: { thinkingConfig: { includeThoughts: true } } },
+                        },
+                    },
+                },
+            },
+        });
+        const result = await llm.generate(
+            { model: 'flash', messages: [{ role: 'user', content: 'hi' }] },
+            { extra: { config: { thinkingConfig: { thinkingLevel: 'HIGH' } } } },
+        );
+        expect(result.ok).toBe(true);
+        expect(client.calls[0]?.options?.config).toEqual({
+            thinkingConfig: { includeThoughts: true, thinkingLevel: 'HIGH' },
+        } as never);
+    });
+
+    it('mergeExtra lets last thinkingBudget/thinkingLevel win without mutating layers', () => {
+        const gemini = createGeminiProvider(fakeClient());
+        function config(thinkingConfig: Record<string, unknown>) {
+            return { config: { temperature: 0, thinkingConfig } };
+        }
+        const layers = [
+            config({ thinkingLevel: 'LOW', includeThoughts: false }),
+            config({ thinkingBudget: 256 }),
+            { config: { temperature: 1 } },
+        ];
+        const copy = structuredClone(layers);
+        expect(gemini.mergeExtra?.(layers)).toEqual({
+            config: { temperature: 1, thinkingConfig: { includeThoughts: false, thinkingBudget: 256 } },
+        });
+        expect(layers).toEqual(copy);
+        expect(gemini.mergeExtra?.([config({ thinkingBudget: 256 }), config({ thinkingLevel: 'LOW' })])).toEqual({
+            config: { temperature: 0, thinkingConfig: { thinkingLevel: 'LOW' } },
+        });
+    });
+
+    it('merges a provider thinkingConfig null with a call thinkingBudget', async () => {
+        const client = fakeClient();
+        const llm = createLlm({
+            providers: {
+                gemini: {
+                    adapter: createGeminiProvider(client),
+                    extra: { config: { thinkingConfig: null } },
+                    models: { flash: { model: 'gemini-3.8-flash' } },
+                },
+            },
+        });
+        const result = await llm.generate(
+            { model: 'flash', messages: [{ role: 'user', content: 'hi' }] },
+            { extra: { config: { thinkingConfig: { thinkingBudget: 5 } } } },
+        );
+        expect(result.ok).toBe(true);
+        expect(client.calls[0]?.options?.config).toEqual({ thinkingConfig: { thinkingBudget: 5 } });
     });
 
     it('passes batch to smart-genai and its unsupported error through', async () => {
@@ -217,6 +333,14 @@ describe('createGeminiProvider', () => {
         });
         expect(createGeminiProvider(fakeClient()).supports).toBe(GEMINI_SUPPORT);
     });
+
+    it('exports the API key env name and the options and extra types', () => {
+        expect(GEMINI_API_KEY_ENV).toBe('GEMINI_API_KEY');
+        const options: GeminiOptions = { env: {}, timeoutMs: 1 };
+        const extra: GeminiExtra = { config: { temperature: 0 } };
+        expect(() => createGeminiProvider(options)).toThrow(GEMINI_API_KEY_ENV);
+        expect(() => createGeminiProvider(fakeClient()).validateExtra?.(extra, 'extra')).not.toThrow();
+    });
 });
 
 describe('Gemini embeddings', () => {
@@ -255,7 +379,7 @@ describe('Gemini embeddings', () => {
         expect(client.embedCalls.at(-1)).toEqual({ model: 'm', input: [{ text: 'x' }] });
     });
 
-    it('passes smart-genai errors without settings and turns a throw into an error', async () => {
+    it('forwards smart-genai errors without settings and catches throws', async () => {
         const client = fakeClient();
         client.embed = async () => ({
             ok: false,
@@ -312,7 +436,7 @@ describe('Gemini answers of failed calls, settings and attempts', () => {
     const usage = { inputTokens: 5, outputTokens: 1, reasoningTokens: 2 };
     const request = { model: 'gemini-3.8-flash', messages: [{ role: 'user' as const, content: 'hi' }] };
 
-    it('keeps the output of a blocked or truncated smart-genai error and leaves out its json, settings and attempts', async () => {
+    it('preserves output on blocked/truncated errors without json, settings, or attempts', async () => {
         const client = fakeClient();
         const gemini = createGeminiProvider(client);
         const genaiSettings = { model: 'gemini-3.8-flash', json: true as const };
@@ -358,39 +482,6 @@ describe('Gemini answers of failed calls, settings and attempts', () => {
     });
 
     /** Creates test LLM instance wrapping Gemini adapter. */
-    function geminiLlm(client: GenaiClient) {
-        return createLlm({
-            defaults: { temperature: 0 },
-            providers: {
-                gemini: {
-                    adapter: createGeminiProvider(client),
-                    extra: { config: { safetySettings: [] } },
-                    models: {
-                        flash: {
-                            model: 'gemini-3.8-flash',
-                            extra: { config: { thinkingConfig: { includeThoughts: true } } },
-                            capabilities: { json: true },
-                        },
-                    },
-                },
-            },
-        });
-    }
-
-    const format = {
-        type: 'json_schema' as const,
-        json_schema: { name: 'a', schema: { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] } },
-    };
-
-    const settings: LlmSettings = {
-        name: 'flash',
-        provider: 'gemini',
-        model: 'gemini-3.8-flash',
-        temperature: 0,
-        jsonMode: 'native',
-        extra: { config: { safetySettings: [], thinkingConfig: { includeThoughts: true, thinkingBudget: 128 } } },
-    };
-
     it('reports the settings with native JSON and the merged extra, and one attempt', async () => {
         const result = await geminiLlm(fakeClient()).flash('hi', {
             response_format: format,
@@ -401,7 +492,7 @@ describe('Gemini answers of failed calls, settings and attempts', () => {
         expect(result.ok ? result.data.attempts : undefined).toBe(1);
     });
 
-    it('puts the answer with the client reasoning and parsed json on a schema mismatch, without a retry', async () => {
+    it('attaches output with reasoning and parsed json on schema mismatch without retry', async () => {
         const client = fakeClient();
         client.generate = async (request) => {
             client.calls.push({ request });
@@ -449,6 +540,62 @@ describe('Gemini answers of failed calls, settings and attempts', () => {
             },
         });
         expect(client.calls).toHaveLength(1);
+    });
+
+    it('delegates smart-genai invalid_json with output to createLlm', async () => {
+        const client = fakeClient();
+        const answer = { text: 'not json', reasoning: 'thought', model: 'gemini-3.8-flash', usage, ms: 3 };
+        client.generate = async () => ({
+            ok: false,
+            error: {
+                code: 'invalid_json',
+                message: 'JSON Parse error: Unexpected identifier "not"',
+                retryable: false,
+                text: answer.text,
+                model: answer.model,
+                usage,
+                ms: 3,
+                output: { ...answer, finishReason: 'STOP', settings: { model: 'm' }, attempts: 1 },
+                settings: { model: 'm' },
+                attempts: 1,
+            },
+        });
+        expect(await createGeminiProvider(client).generate(request, call)).toEqual({
+            ok: true,
+            data: { ...answer, finishReason: 'STOP' },
+        });
+        expect(await createGeminiProvider(client).generate({ ...request, batch: true }, call)).toEqual({
+            ok: true,
+            data: { ...answer, finishReason: 'STOP' },
+        });
+        const result = await geminiLlm(client).flash('hi', {
+            response_format: format,
+            extra: { config: { thinkingConfig: { thinkingBudget: 128 } } },
+        });
+        expect(result).toEqual({
+            ok: false,
+            error: {
+                code: 'invalid_json',
+                message: 'The answer is not JSON',
+                retryable: false,
+                text: 'not json',
+                model: 'gemini-3.8-flash',
+                usage,
+                ms: 3,
+                name: 'flash',
+                provider: 'gemini',
+                output: { ...answer, finishReason: 'STOP', name: 'flash', provider: 'gemini' },
+                settings,
+                attempts: 1,
+            },
+        });
+    });
+
+    it('passes a smart-genai invalid_json error without output through as error', async () => {
+        const client = fakeClient();
+        const error = { code: 'invalid_json' as const, message: 'no answer text', retryable: false };
+        client.generate = async () => ({ ok: false, error: { ...error, settings: { model: 'm' }, attempts: 1 } });
+        expect(await createGeminiProvider(client).generate(request, call)).toEqual({ ok: false, error });
     });
 
     it('carries the output of a blocked smart-genai error through createLlm', async () => {

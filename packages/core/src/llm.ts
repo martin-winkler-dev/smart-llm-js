@@ -120,13 +120,22 @@ const MODEL_KEYS: ReadonlySet<string> = new Set([
 ]);
 const CALL_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'extra']);
 
-/** Members of `LlmEmbedRequest`, of an input object and of the `embed` options. */
+/** Allowed keys for embedding requests, inputs, and options. */
 const EMBED_KEYS: ReadonlySet<string> = new Set(['model', 'input', 'task', 'dimensions']);
 const EMBED_INPUT_KEYS: ReadonlySet<string> = new Set(['text', 'title']);
 const EMBED_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
 
+/** Members of the `listModels` options. */
+const LIST_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
+
 /** Values of `LlmEmbedTask`. */
 const EMBED_TASKS: ReadonlySet<unknown> = new Set(['query', 'document', 'similarity', 'classification', 'clustering']);
+
+/** Token count fields of `LlmUsage`. */
+const USAGE_KEYS: readonly string[] = ['inputTokens', 'outputTokens', 'reasoningTokens'];
+
+/** Token count fields of embedding usage. */
+const EMBED_USAGE_KEYS: readonly string[] = ['inputTokens'];
 
 /** Request fields copied unchanged into settings. */
 const SETTING_FIELDS = [
@@ -186,7 +195,7 @@ export function createLlm<const C extends LlmConfig>(config: C): Llm<LlmModelNam
     const charsPerToken = validateCharsPerToken(config.charsPerToken, 'charsPerToken') ?? DEFAULT_CHARS_PER_TOKEN;
     // deep clone configuration to prevent external mutations from affecting calls
     const shared: SharedSettings = {
-        defaults: copyPlain(config.defaults),
+        defaults: copyPlain(config.defaults, 'defaults'),
         limiterOptions: config.limiterOptions ?? {},
         charsPerToken,
     };
@@ -238,9 +247,12 @@ export function createLlm<const C extends LlmConfig>(config: C): Llm<LlmModelNam
 
 /**
  * Creates model entries and queues for provider.
- * @throws {TypeError} If provider configuration or adapter is invalid.
+ * @throws {TypeError} If provider configuration, adapter, provider name or model name is invalid.
  */
 function createProviderEntries(providerName: string, spec: LlmProviderSpec, shared: SharedSettings): ModelEntry[] {
+    if (providerName === '') {
+        throw new TypeError('Invalid value for option "providers": an empty provider name');
+    }
     const option = `providers.${providerName}`;
     checkKeys(spec, PROVIDER_KEYS, `${option}.`);
     const { adapter } = spec;
@@ -276,6 +288,9 @@ function createProviderEntries(providerName: string, spec: LlmProviderSpec, shar
     }
     const providerBuckets = createLimitBuckets(spec.sharedLimits, `${option}.sharedLimits`, true);
     return Object.entries<string | LlmModelSpec>(spec.models).map(([name, entry]) => {
+        if (name === '') {
+            throw new TypeError(`Invalid value for option "${option}.models": an empty model name`);
+        }
         const modelOption = `${option}.models.${name}`;
         const model = toModelSpec(entry, modelOption);
         validateExtra(adapter, model.extra, `${modelOption}.extra`);
@@ -295,8 +310,15 @@ function createProviderEntries(providerName: string, spec: LlmProviderSpec, shar
                 ),
             ),
             adapter,
-            defaults: [shared.defaults, copyPlain(spec.defaults), copyPlain(model.defaults)],
-            extras: [copyPlain(spec.extra ?? {}), copyPlain(model.extra ?? {})],
+            defaults: [
+                shared.defaults,
+                copyPlain(spec.defaults, `${option}.defaults`),
+                copyPlain(model.defaults, `${modelOption}.defaults`),
+            ],
+            extras: [
+                copyPlain(spec.extra ?? {}, `${option}.extra`),
+                copyPlain(model.extra ?? {}, `${modelOption}.extra`),
+            ],
             queue: createQueue<Job, Answer>({
                 ...shared.limiterOptions,
                 concurrency,
@@ -357,7 +379,7 @@ async function generate(
     if (!checked.ok) {
         return checked;
     }
-    const { entry, filled } = checked.data;
+    const { entry, filled, extra: callExtra } = checked.data;
     const names = { name: entry.name, provider: entry.provider };
     let job: Job | undefined;
     let settings: LlmSettings | undefined;
@@ -366,8 +388,9 @@ async function generate(
         if (!prepared.ok) {
             return { ok: false, error: { ...prepared.error, ...names } };
         }
-        const layers = [...entry.extras, options.extra ?? {}];
-        const extra = entry.adapter.mergeExtra?.(layers) ?? Object.assign({}, ...layers);
+        // copy layers so adapter mutations never reach stored extra; call extra is a copy from checkCall
+        const layers = [...copyPlain(entry.extras), callExtra];
+        const extra = entry.adapter.mergeExtra?.(layers) ?? mergeExtras(layers);
         job = { prepared: prepared.data, extra, attempts: 0 };
         settings = toSettings(entry, prepared.data, extra);
         const isBatch = prepared.data.request.batch === true;
@@ -390,6 +413,19 @@ async function generate(
                     : toCallError(entry, unexpected, settings, job?.attempts ?? 0),
         };
     }
+}
+
+/** Shallow-merges extra layers (later keys win); an `undefined` value keeps the earlier value. */
+function mergeExtras(layers: Record<string, unknown>[]): Record<string, unknown> {
+    const merged: Record<string, unknown> = {};
+    for (const layer of layers) {
+        for (const [key, value] of Object.entries(layer)) {
+            if (value !== undefined) {
+                merged[key] = value;
+            }
+        }
+    }
+    return merged;
 }
 
 /** Extracts applied settings from prepared request and merged extra options. */
@@ -475,12 +511,12 @@ function toMessages(input: LlmModelInput): LlmMessage[] {
     throw new TypeError('Invalid value for the input: a string, content parts or messages');
 }
 
-/** Validates call options, resolves model entry, and applies defaults. */
+/** Validates call options, resolves model entry, applies defaults, and copies call extra. */
 function checkCall(
     entries: ReadonlyMap<string, ModelEntry>,
     request: LlmRequest,
     options: LlmCallOptions,
-): Result<{ entry: ModelEntry; filled: LlmRequest }, LlmError> {
+): Result<{ entry: ModelEntry; filled: LlmRequest; extra: Record<string, unknown> }, LlmError> {
     let entry: ModelEntry | undefined;
     try {
         // lookup early so errors carry model and provider names
@@ -500,11 +536,13 @@ function checkCall(
         if (entry === undefined) {
             throw new TypeError(`Invalid value for option "model": ${request.model} is not configured`);
         }
+        // copy before adapter check: a cyclic extra fails here as invalid request
+        const extra = copyPlain(options.extra ?? {}, 'extra');
         if (options.extra !== undefined) {
-            entry.adapter.validateExtra?.(options.extra, 'extra');
+            entry.adapter.validateExtra?.(extra, 'extra');
         }
         const filled = applyDefaults(request, ...entry.defaults);
-        return { ok: true, data: { entry, filled } };
+        return { ok: true, data: { entry, filled, extra } };
     } catch (error) {
         const invalid: LlmError = { code: 'invalid_request', message: errorMessage(error), retryable: false };
         return {
@@ -518,7 +556,9 @@ function checkCall(
  * **Executes embedding request**: splits input into batched provider calls via embedding queue.
  *
  * - books token estimates per batch, settled on reported input tokens
- * - fails fast on first failing call and aborts remaining batches
+ * - fails fast on first failing call and aborts remaining batches (not on a release by a stopping queue)
+ * - error preference: batch that ended the call (limiter error with job error as `cause`), then last provider
+ *   error of other started batch, then limiter error of unstarted batch
  */
 async function embed(
     entries: ReadonlyMap<string, ModelEntry>,
@@ -547,8 +587,12 @@ async function embed(
             attempts: 0,
         });
     }
-    // capture first failure in time to abort remaining batches immediately
+    // error of the batch that ended the call: its limiter error carries the job error (fatal, retries or wait exceeded)
+    let triggered: AttemptError | undefined;
+    // last provider error of a started batch that was released or aborted after another batch failed
     let failed: AttemptError | undefined;
+    // limiter error of a batch that never made a provider call; only used when no started batch failed
+    let unstarted: AttemptError | undefined;
     try {
         const outcomes = await Promise.all(
             jobs.map(async (job) => {
@@ -558,16 +602,39 @@ async function embed(
                 );
                 const cost = { tokens: Math.ceil(characters / entry.charsPerToken) };
                 const outcome = await entry.embedQueue.push(job, { cost, signal });
-                if (!outcome.ok && failed === undefined) {
-                    failed = fromLimiterError(outcome.error, job);
-                    controller.abort();
+                if (!outcome.ok) {
+                    const { code, cause } = outcome.error;
+                    // smart-limit sets the reason of the aborted push signal as cause
+                    const isOwnAbort =
+                        code === 'ABORTED' && controller.signal.aborted && cause === controller.signal.reason;
+                    const error = fromLimiterError(outcome.error, job);
+                    // an abort (own or caller) is never the trigger, also when an adapter reports it as job error
+                    if (cause !== undefined && error.code !== 'aborted') {
+                        triggered ??= error;
+                    } else if (isOwnAbort && job.lastError !== undefined) {
+                        failed ??= job.lastError;
+                    } else if (
+                        job.lastError === undefined &&
+                        (isOwnAbort || code === 'MAX_WAIT_EXCEEDED' || code === 'STOPPED')
+                    ) {
+                        unstarted ??= error;
+                    } else {
+                        failed ??= error;
+                    }
+                    // released without cause: the queue is stopping and releases the other batches itself;
+                    // aborting now would turn the outcome of the batch that stopped it into ABORTED
+                    const isReleased = (code === 'MAX_WAIT_EXCEEDED' || code === 'STOPPED') && cause === undefined;
+                    if (!isReleased) {
+                        controller.abort();
+                    }
                 }
                 return outcome;
             }),
         );
         const attempts = jobs.reduce((sum, job) => sum + job.attempts, 0);
-        if (failed !== undefined) {
-            const { output: _output, ...error } = failed;
+        const chosen = triggered ?? failed ?? unstarted;
+        if (chosen !== undefined) {
+            const { output: _output, ...error } = chosen;
             return { ok: false, error: { ...error, ...names, attempts } };
         }
         const embeddings: number[][] = [];
@@ -608,9 +675,15 @@ function checkEmbed(
         if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
             throw new TypeError('Invalid value for option "signal"');
         }
+        if (!isPlainObject(request)) {
+            throw new TypeError('Invalid value for option "request"');
+        }
         checkKeys(request, EMBED_KEYS, '');
+        if (typeof request.model !== 'string' || request.model === '') {
+            throw new TypeError('Invalid value for option "model"');
+        }
         if (entry === undefined) {
-            throw new TypeError(`Invalid value for option "model": ${String(model)} is not configured`);
+            throw new TypeError(`Invalid value for option "model": ${request.model} is not configured`);
         }
         const given: unknown = typeof request.input === 'string' ? [request.input] : request.input;
         if (!Array.isArray(given) || given.length === 0) {
@@ -675,6 +748,7 @@ async function attemptEmbed(
     job.attempts += 1;
     try {
         const result = await (adapter.embed as NonNullable<LlmProvider['embed']>)(job.request, { signal });
+        checkResult(result, isEmbedOutput, adapter.name);
         if (!result.ok) {
             job.lastError = result.error;
             return toJobError(result.error);
@@ -688,7 +762,8 @@ async function attemptEmbed(
         const tokens = result.data.usage.inputTokens;
         return tokens === null ? { ok: true, data: result.data } : { ok: true, data: result.data, usage: { tokens } };
     } catch (error) {
-        return toJobError(unexpectedError(error));
+        job.lastError = unexpectedError(error);
+        return toJobError(job.lastError);
     }
 }
 
@@ -698,6 +773,14 @@ async function listModels(
     provider: string,
     options: { signal?: AbortSignal },
 ): Promise<Result<LlmModelInfo[], LlmError>> {
+    try {
+        checkKeys(options, LIST_OPTION_KEYS, '');
+        if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+            throw new TypeError('Invalid value for option "signal"');
+        }
+    } catch (error) {
+        return { ok: false, error: { code: 'invalid_request', message: errorMessage(error), retryable: false } };
+    }
     const adapter = adapters.get(provider);
     if (adapter === undefined) {
         const message = `Invalid value for option "provider": ${provider} is not configured`;
@@ -743,9 +826,9 @@ async function attempt(
     isBatch: boolean,
 ): Promise<JobResult<Answer>> {
     job.attempts += 1;
-    // catch adapter throws or malformed results and map to unexpected error
     try {
         const result = await adapter.generate(job.prepared.request, { signal, extra: job.extra });
+        checkResult(result, isProviderOutput, adapter.name);
         if (isBatch) {
             const checked = result.ok ? checkAnswer(job.prepared, result.data) : result;
             if (checked.ok) {
@@ -778,7 +861,7 @@ async function attempt(
     }
 }
 
-/** Parses and validates answer text against expected JSON schema. */
+/** Parses and validates answer text against expected JSON schema, or as JSON object without schema. */
 function checkAnswer(prepared: PreparedRequest, output: LlmProviderOutput): Result<Answer, AttemptError> {
     if (!prepared.json || (output.toolCalls?.length ?? 0) > 0) {
         return { ok: true, data: output };
@@ -791,7 +874,7 @@ function checkAnswer(prepared: PreparedRequest, output: LlmProviderOutput): Resu
             error: {
                 code: 'invalid_json',
                 message: 'The answer is not JSON',
-                retryable: prepared.prompted,
+                retryable: false,
                 ...answered,
                 output,
             },
@@ -802,13 +885,16 @@ function checkAnswer(prepared: PreparedRequest, output: LlmProviderOutput): Resu
             ? removeOptionalNulls(parsed.value, prepared.schema)
             : parsed.value;
     const mismatch = prepared.schema === undefined ? undefined : findSchemaMismatch(json, prepared.schema);
-    if (mismatch !== undefined) {
+    if (mismatch !== undefined || (prepared.schema === undefined && !isPlainObject(json))) {
         return {
             ok: false,
             error: {
                 code: 'invalid_json',
-                message: `The answer does not match the schema: ${mismatch}`,
-                retryable: prepared.prompted,
+                message:
+                    mismatch === undefined
+                        ? 'The answer is not a JSON object'
+                        : `The answer does not match the schema: ${mismatch}`,
+                retryable: false,
                 ...answered,
                 output: { ...output, json },
             },
@@ -819,9 +905,7 @@ function checkAnswer(prepared: PreparedRequest, output: LlmProviderOutput): Resu
 
 /** Maps attempt error to smart-limit job error with retry and usage policy. */
 function toJobError(error: AttemptError): { ok: false; error: JobError } {
-    const type: JobErrorType =
-        error.code === 'invalid_json' && error.retryable ? 'retry_immediate' : jobErrorType(error);
-    const jobError: JobError = { type, message: error.message, code: error.code, cause: error };
+    const jobError: JobError = { type: jobErrorType(error), message: error.message, code: error.code, cause: error };
     if (error.retryAfterMs !== undefined) {
         jobError.retryAfterMs = error.retryAfterMs;
     }
@@ -906,6 +990,61 @@ function unexpectedError(error: unknown): LlmError {
 /** Extracts error message string from unknown error. */
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * **Checks adapter result shape**: lenient guard so malformed results map to `unexpected`.
+ *
+ * - success: plain `data` accepted by `isData`
+ * - failure: plain `error` with string `code`/`message` and boolean `retryable`
+ * - `usage` (also optional error `usage`): each token field finite non-negative number or `null`
+ * @throws {Error} If result is malformed.
+ */
+function checkResult(result: unknown, isData: (data: Record<string, unknown>) => boolean, name: string): void {
+    const valid =
+        isPlainObject(result) &&
+        (result.ok === true
+            ? isPlainObject(result.data) && isData(result.data)
+            : result.ok === false &&
+              isPlainObject(result.error) &&
+              typeof result.error.code === 'string' &&
+              typeof result.error.message === 'string' &&
+              typeof result.error.retryable === 'boolean' &&
+              (result.error.usage === undefined || isUsage(result.error.usage, USAGE_KEYS)));
+    if (!valid) {
+        throw new Error(`${name} returned a malformed result`);
+    }
+}
+
+/** Checks generation output fields core reads; `text` may be empty, optional fields are not checked. */
+function isProviderOutput(data: Record<string, unknown>): boolean {
+    return (
+        typeof data.text === 'string' &&
+        typeof data.model === 'string' &&
+        isUsage(data.usage, USAGE_KEYS) &&
+        typeof data.ms === 'number'
+    );
+}
+
+/** Checks embedding output fields core reads. */
+function isEmbedOutput(data: Record<string, unknown>): boolean {
+    return (
+        Array.isArray(data.embeddings) &&
+        typeof data.model === 'string' &&
+        isUsage(data.usage, EMBED_USAGE_KEYS) &&
+        typeof data.ms === 'number'
+    );
+}
+
+/** Checks usage object: each of `keys` finite non-negative number or `null`. */
+function isUsage(usage: unknown, keys: readonly string[]): boolean {
+    return (
+        isPlainObject(usage) &&
+        keys.every((key) => {
+            const count = usage[key];
+            return count === null || (typeof count === 'number' && Number.isFinite(count) && count >= 0);
+        })
+    );
 }
 
 /** Checks whether value is undefined or a function. */

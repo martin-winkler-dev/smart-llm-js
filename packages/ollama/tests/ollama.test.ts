@@ -5,6 +5,73 @@ import { describe, expect, it } from 'bun:test';
 import { createLlm, type LlmResponseFormat, type LlmSettings } from '@smart-llm/core';
 import { createOllamaProvider, fetchOllamaCapabilities, OLLAMA_SUPPORT } from '../src/index.js';
 
+// -------------------------------------------------------------------
+// --- 1. Constants
+// -------------------------------------------------------------------
+
+const format: LlmResponseFormat = {
+    type: 'json_schema',
+    json_schema: {
+        name: 'count',
+        schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] },
+    },
+};
+
+const names = { name: 'qwen', provider: 'ollama' };
+
+const settings: LlmSettings = {
+    ...names,
+    model: 'qwen2.5:7b',
+    seed: 1,
+    stop: ['END'],
+    max_tokens: 64,
+    jsonMode: 'grammar',
+};
+
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
+
+/** Creates fake queued fetch implementation recording request bodies. */
+function queueFetch(...answers: (() => Response)[]): { fetch: typeof fetch; bodies: Record<string, unknown>[] } {
+    const bodies: Record<string, unknown>[] = [];
+    async function fetcher(_url: string, init: RequestInit): Promise<Response> {
+        bodies.push(JSON.parse(String(init.body)));
+        const next = answers.length > 1 ? answers.shift() : answers[0];
+        return (next as () => Response)();
+    }
+    return { fetch: fetcher as typeof fetch, bodies };
+}
+
+/** Returns mock response factory with specified content and finish reason. */
+function reply(content: string, finishReason = 'stop'): () => Response {
+    return () =>
+        new Response(
+            JSON.stringify({
+                model: 'qwen2.5:7b',
+                choices: [{ finish_reason: finishReason, message: { content, reasoning: 'hmm' } }],
+                usage: { prompt_tokens: 2, completion_tokens: 6 },
+            }),
+        );
+}
+
+/** Creates test LLM instance wrapping Ollama provider with queued responses. */
+function ollamaLlm(...answers: (() => Response)[]) {
+    const fake = queueFetch(...answers);
+    const llm = createLlm({
+        defaults: { seed: 1 },
+        limiterOptions: { maxRetries: 2, retryDelayMs: 1, maxWaitMs: 50 },
+        providers: {
+            ollama: {
+                adapter: createOllamaProvider({ fetch: fake.fetch }),
+                defaults: { stop: ['END'] },
+                models: { qwen: { model: 'qwen2.5:7b', defaults: { max_tokens: 64 }, capabilities: { json: true } } },
+            },
+        },
+    });
+    return { llm, bodies: fake.bodies };
+}
+
 describe('createOllamaProvider', () => {
     it('posts to the local server without a key and reads reasoning', async () => {
         const sent: { url: string; init: RequestInit }[] = [];
@@ -104,6 +171,60 @@ describe('fetchOllamaCapabilities', () => {
             { ok: true, data: {} },
         ]);
     });
+
+    it('strips /v1 and trailing slashes from baseUrl', async () => {
+        const urls: string[] = [];
+        async function fetcher(url: string): Promise<Response> {
+            urls.push(url);
+            return new Response('{"models":[]}');
+        }
+        for (const baseUrl of ['http://h:11434/v1', 'http://h:11434/v1/', 'http://h:11434/v1//', 'http://h:11434/']) {
+            await fetchOllamaCapabilities({ baseUrl, fetch: fetcher as typeof fetch });
+        }
+        await fetchOllamaCapabilities({ baseUrl: 'http://h:11434', fetch: fetcher as typeof fetch });
+        await fetchOllamaCapabilities({ fetch: fetcher as typeof fetch });
+        expect(urls).toEqual([...Array(5).fill('http://h:11434/api/tags'), 'http://localhost:11434/api/tags']);
+    });
+
+    it('sends apiKey as bearer token and none without it', async () => {
+        const headers: (Record<string, string> | undefined)[] = [];
+        async function fetcher(_url: string, init: RequestInit): Promise<Response> {
+            headers.push(init.headers as Record<string, string> | undefined);
+            return new Response('{"models":[]}');
+        }
+        await fetchOllamaCapabilities({ apiKey: 'key', fetch: fetcher as typeof fetch });
+        await fetchOllamaCapabilities({ fetch: fetcher as typeof fetch });
+        expect(headers[0]?.authorization).toBe('Bearer key');
+        expect(headers[1]?.authorization).toBeUndefined();
+    });
+
+    it('keeps a model named __proto__ as own entry', async () => {
+        async function fetcher(): Promise<Response> {
+            return new Response('{"models":[{"name":"__proto__","capabilities":["tools"]}]}');
+        }
+        const result = await fetchOllamaCapabilities({ fetch: fetcher as unknown as typeof fetch });
+        const data = result.ok ? result.data : {};
+        expect(Object.keys(data)).toEqual(['__proto__']);
+        expect(Object.getPrototypeOf(data)).toBe(Object.prototype);
+    });
+
+    it('maps caller AbortSignal.timeout to aborted and internal timeoutMs to timeout', async () => {
+        async function hanging(_url: string, init: RequestInit): Promise<Response> {
+            return new Promise((_resolve, reject) => {
+                init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+            });
+        }
+        const fetcher = hanging as typeof fetch;
+        expect(await fetchOllamaCapabilities({ signal: AbortSignal.timeout(5), fetch: fetcher })).toMatchObject({
+            ok: false,
+            error: { code: 'aborted', retryable: false },
+        });
+        const signal = new AbortController().signal;
+        expect(await fetchOllamaCapabilities({ signal, timeoutMs: 5, fetch: fetcher })).toMatchObject({
+            ok: false,
+            error: { code: 'timeout', retryable: true },
+        });
+    });
 });
 
 describe('OLLAMA_SUPPORT', () => {
@@ -117,68 +238,31 @@ describe('OLLAMA_SUPPORT', () => {
         });
         expect(createOllamaProvider().supports).toEqual(OLLAMA_SUPPORT);
     });
+
+    it('snapshots OLLAMA_SUPPORT at provider creation', async () => {
+        const urls: string[] = [];
+        async function fetcher(url: string): Promise<Response> {
+            urls.push(url);
+            return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }] }));
+        }
+        const ollama = createOllamaProvider({ fetch: fetcher as typeof fetch });
+        const support = OLLAMA_SUPPORT as { embeddings?: true };
+        delete support.embeddings;
+        try {
+            const result = await ollama.embed?.(
+                { model: 'bge-m3', input: [{ text: 'a' }] },
+                { signal: new AbortController().signal },
+            );
+            expect(result).toMatchObject({ ok: true, data: { embeddings: [[1]] } });
+            expect(ollama.supports.embeddings).toBe(true);
+            expect(urls).toEqual(['http://localhost:11434/v1/embeddings']);
+        } finally {
+            support.embeddings = true;
+        }
+    });
 });
 
-/** Creates fake queued fetch implementation recording request bodies. */
-function queueFetch(...answers: (() => Response)[]): { fetch: typeof fetch; bodies: Record<string, unknown>[] } {
-    const bodies: Record<string, unknown>[] = [];
-    async function fetcher(_url: string, init: RequestInit): Promise<Response> {
-        bodies.push(JSON.parse(String(init.body)));
-        const next = answers.length > 1 ? answers.shift() : answers[0];
-        return (next as () => Response)();
-    }
-    return { fetch: fetcher as typeof fetch, bodies };
-}
-
-/** Returns mock response factory with specified content and finish reason. */
-function reply(content: string, finishReason = 'stop'): () => Response {
-    return () =>
-        new Response(
-            JSON.stringify({
-                model: 'qwen2.5:7b',
-                choices: [{ finish_reason: finishReason, message: { content, reasoning: 'hmm' } }],
-                usage: { prompt_tokens: 2, completion_tokens: 6 },
-            }),
-        );
-}
-
-/** Creates test LLM instance wrapping Ollama provider with queued responses. */
-function ollamaLlm(...answers: (() => Response)[]) {
-    const fake = queueFetch(...answers);
-    const llm = createLlm({
-        defaults: { seed: 1 },
-        limiterOptions: { maxRetries: 2, retryDelayMs: 1, maxWaitMs: 50 },
-        providers: {
-            ollama: {
-                adapter: createOllamaProvider({ fetch: fake.fetch }),
-                defaults: { stop: ['END'] },
-                models: { qwen: { model: 'qwen2.5:7b', defaults: { max_tokens: 64 }, capabilities: { json: true } } },
-            },
-        },
-    });
-    return { llm, bodies: fake.bodies };
-}
-
-const format: LlmResponseFormat = {
-    type: 'json_schema',
-    json_schema: {
-        name: 'count',
-        schema: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] },
-    },
-};
-
-const names = { name: 'qwen', provider: 'ollama' };
-
-const settings: LlmSettings = {
-    ...names,
-    model: 'qwen2.5:7b',
-    seed: 1,
-    stop: ['END'],
-    max_tokens: 64,
-    jsonMode: 'grammar',
-};
-
-describe('Ollama through createLlm: settings, attempts and the answer of failed calls', () => {
+describe('Ollama through createLlm', () => {
     it('reports the settings with JSON as a grammar and one attempt', async () => {
         const { llm, bodies } = ollamaLlm(reply('{"n":2}'));
         const result = await llm.qwen('count?', { response_format: format });
@@ -200,12 +284,12 @@ describe('Ollama through createLlm: settings, attempts and the answer of failed 
         expect(bodies[0]).toMatchObject({ response_format: { type: 'json_schema' }, seed: 1, stop: ['END'] });
     });
 
-    it('retries a schema mismatch and puts the last answer with reasoning and json on invalid_json', async () => {
+    it('attaches output with reasoning and json on schema mismatch without retry', async () => {
         const { llm, bodies } = ollamaLlm(reply('{"n":"x"}'));
         const result = await llm.qwen('count?', { response_format: format });
         expect(result).toMatchObject({
             ok: false,
-            error: { code: 'invalid_json', retryable: true, text: '{"n":"x"}', ...names, settings, attempts: 3 },
+            error: { code: 'invalid_json', retryable: false, text: '{"n":"x"}', ...names, settings, attempts: 1 },
         });
         expect(result.ok ? undefined : result.error.output).toEqual({
             text: '{"n":"x"}',
@@ -217,11 +301,7 @@ describe('Ollama through createLlm: settings, attempts and the answer of failed 
             ms: expect.any(Number),
             ...names,
         });
-        expect(bodies).toHaveLength(3);
-        const recovered = await ollamaLlm(reply('{"n":"x"}'), reply('{"n":3}')).llm.qwen('count?', {
-            response_format: format,
-        });
-        expect(recovered).toMatchObject({ ok: true, data: { json: { n: 3 }, attempts: 2 } });
+        expect(bodies).toHaveLength(1);
     });
 
     it('puts the answer with reasoning on truncated and blocked errors after one attempt', async () => {
@@ -244,7 +324,7 @@ describe('Ollama through createLlm: settings, attempts and the answer of failed 
         }
     });
 
-    it('puts no output but the settings on an HTTP error and a network failure', async () => {
+    it('omits output but includes settings on HTTP and network errors', async () => {
         /** Returns mock 404 response for unknown model. */
         function notFound(): Response {
             return new Response('{"error":"model \\"qwen2.5:7b\\" not found"}', { status: 404 });

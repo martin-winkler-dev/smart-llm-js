@@ -4,9 +4,9 @@
 [![Package](https://github.com/martin-winkler-dev/smart-llm-js/actions/workflows/package.yml/badge.svg)](https://github.com/martin-winkler-dev/smart-llm-js/actions/workflows/package.yml)
 [![Bun](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmartin-winkler-dev%2Fsmart-llm-js%2Fmain%2Fpackages%2Fgemini%2Fpackage.json&query=%24.engines.bun&label=Bun&logo=bun&color=blue)](https://bun.sh)
 [![Node.js](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmartin-winkler-dev%2Fsmart-llm-js%2Fmain%2Fpackages%2Fgemini%2Fpackage.json&query=%24.engines.node&label=Node.js&logo=nodedotjs&color=blue)](https://nodejs.org)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/martin-winkler-dev/smart-llm-js/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Gemini provider adapter (`createGeminiProvider`, `GEMINI_SUPPORT`) for [smart-llm](https://github.com/martin-winkler-dev/smart-llm-js#readme), supporting the Gemini Developer API (AI Studio) and Vertex AI via [smart-genai](https://www.npmjs.com/package/smart-genai). No classes; post-initialization methods never throw.
+Gemini adapter for [smart-llm](https://github.com/martin-winkler-dev/smart-llm-js#readme): connects the Gemini Developer API (AI Studio) and Vertex AI through [smart-genai](https://www.npmjs.com/package/smart-genai).
 
 ## Install
 
@@ -18,7 +18,7 @@ npm install @smart-llm/gemini @smart-llm/core
 
 ESM package with TypeScript types for Node.js >= 22.12 (`require()` supported) and Bun >= 1.3.
 
-## Quickstart
+## Usage
 
 ```ts
 import { createLlm } from '@smart-llm/core';
@@ -56,40 +56,82 @@ const vectors = await llm.embed({ model: 'vec', input: ['First paragraph', 'Seco
 
 ## Options
 
-`createGeminiProvider(clientOrOptions?)` accepts an existing `GenaiClient` instance from `smart-genai` or `Omit<GenaiClientOptions, 'defaults'>`:
+`createGeminiProvider(clientOrOptions?: GenaiClient | GeminiOptions)` accepts an existing `smart-genai` client or `GeminiOptions` (`Omit<GenaiClientOptions, 'defaults'>`). Passing `defaults` or setting both `apiKey` and `vertex` throws `TypeError`; set request defaults in `createLlm`. A passed client created with `defaults` keeps applying them.
 
-| Option | Default | Description |
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `apiKey` | `string` | env `GEMINI_API_KEY` | Developer API key (`GEMINI_API_KEY_ENV`); Developer API only |
+| `vertex` | `boolean` \| `GenaiVertexOptions` | `undefined` | `true` or `{ project?, location?, bucket?, credentialsFile?, authClient?, storageUrl? }` for Vertex AI |
+| `baseUrl` | `string` | official endpoint | Custom API endpoint URL |
+| `env` | `Readonly<Record<string, string \| undefined>>` | `process.env` | Environment map for the API key and the Vertex AI project, location, bucket, and credentials file |
+| `timeoutMs` | `number` | `120_000` | HTTP timeout per call in milliseconds (2 minutes) |
+| `batchWaitSec` | `number` | `10` | Collection window in seconds for batch calls (`1` to `600`) |
+
+Vertex AI also reads `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (default `'global'`), `VERTEX_BATCH_BUCKET`, and `GOOGLE_APPLICATION_CREDENTIALS` (else gcloud ADC). Missing or invalid credentials throw `TypeError`.
+
+## Extra Options
+
+`extra` (provider, model, or call layer) accepts only `GeminiExtra`:
+
+| Key | Type | Description |
 |---|---|---|
-| `apiKey` | env `GEMINI_API_KEY` | Developer API key (Developer API only) |
-| `vertex` | `undefined` | `true` or `{ project?, location?, bucket?, credentialsFile?, authClient?, storageUrl? }` for Vertex AI |
-| `baseUrl` | official endpoint | Custom API endpoint URL |
-| `env` | `process.env` | Environment map used for credential and project lookup |
-| `timeoutMs` | `120_000` | HTTP request timeout per call in milliseconds (2 minutes) |
-| `batchWaitSec` | `10` | Aggregation window in seconds for batch calls (`1` to `600`) |
+| `config` | `GenerateContentConfig` | Gemini request configuration passed to smart-genai |
 
-Passing `defaults` to `createGeminiProvider` throws a `TypeError`; configure request defaults in `createLlm`.
+- **Merge**: `config` merges across provider, model, and call layers per top-level field (later layers win; nested objects such as `toolConfig` are replaced whole). `thinkingConfig` merges per member; `thinkingBudget` and `thinkingLevel` count as one setting, so the last layer that sets either replaces both from earlier layers.
+- **Validation**: other `extra` keys, a non-object `config`, own `__proto__` keys, a `config.tools` that is neither an array nor `null`, and `abortSignal` / `httpOptions` / `automaticContinuation` inside `config` are rejected (`TypeError` at setup, `invalid_request` per call).
 
-## Supported Capabilities (`GEMINI_SUPPORT`)
+## Capabilities
 
-```ts
-const GEMINI_SUPPORT = {
-    images: true,
-    tools: true,
-    webSearch: true,
-    reasoning: true,
-    batch: true,
-    json: 'native',
-    embeddings: true,
-};
-```
+`GEMINI_SUPPORT`: `{ images: true, tools: true, webSearch: true, reasoning: true, batch: true, json: 'native', embeddings: true }`.
 
-- **Structured JSON (`native` mode)**: Forwards cleaned JSON Schemas natively as Gemini `responseJsonSchema` and validates responses against the schema.
-- **Reasoning**: Maps `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) via `smart-genai` to thinking budgets on Gemini 2.x (`0` for `none`, `128` minimum on 2.5 Pro) or thinking levels on Gemini 3.x (`none` maps to `minimal` as Gemini 3 cannot disable thinking; `xhigh` and `max` map to `high`). Thought summaries return in `data.reasoning` (`includeThoughts: true` when `reasoning_effort` is set; suppress via `extra: { config: { thinkingConfig: { includeThoughts: false } } }`). Assistant `reasoning` in message history is stripped before sending.
-- **Tools & Thought Signatures**: Preserves Gemini 3 thought signatures in `toolCall.extra_content.google.thought_signature` across conversation turns (preserved automatically by `assistantMessage`). Missing call IDs are assigned `call_<uuid>`. Combining `tools` with `web_search: true` is supported on Gemini 3+ and rejected on Gemini 2.x.
-- **Web Search Grounding**: `web_search: true` enables Google Search grounding; citations return in `data.sources` (`{ url, title? }`).
-- **Batch Calls**: `batch: true` aggregates calls arriving within `batchWaitSec` into Gemini Batch API jobs (50% cost reduction; requires `vertex.bucket` / env `VERTEX_BATCH_BUCKET` on Vertex AI). Executes through the model's `batchQueue` bounded only by `modelLimits.concurrency`.
-- **Embeddings**: Supports `task` (`'query'`, `'document'`, `'similarity'`, `'classification'`, `'clustering'`), `title` (with `task: 'document'`), and `dimensions`. Embeds up to `100` texts per call (`maxEmbedInputs: 100`) on the Developer API and for `gemini-embedding-001` on Vertex AI. On Vertex AI, `gemini-embedding-2` accepts `1` text per call; configure `capabilities: { embeddings: { supported: true, maxInputs: 1 } }` so `llm.embed` splits batches into single-text calls automatically. `usage.inputTokens` is `null` (unreported by the Gemini embedding API).
-- **Extra Configuration (`extra.config`)**: Validates and deep-merges `extra: { config }` (`GenaiConfig`) across provider, model, and call layers. Other keys in `extra` are rejected.
-- **Model Listing**: `llm.listModels('gemini')` returns `{ id, displayName?, inputTokenLimit?, outputTokenLimit? }[]`.
+- **Messages**: `stop` takes up to 5 sequences and `seed` must be a 32-bit signed integer (`invalid_request` otherwise).
+- **Images**: base64 data URLs; `detail` is not sent.
+- **Tools**: missing call IDs become `call_` plus 32 hex characters. Thought signatures are kept in `toolCall.extra_content.google.thought_signature` and replayed on the next turn (`assistantMessage` keeps them). `strict` on tool schemas is not sent; `tool_choice` is stripped by `@smart-llm/core` when `tools` is omitted (even if `extra.config.tools` declares functions). `tools` and `web_search: true` append after `extra.config.tools` and fail with `invalid_request` on `gemini-2.*` models.
+- **JSON** (`native`): sends the cleaned JSON Schema as `responseJsonSchema`. On Vertex AI batch, `required` is stripped and `responseSchema` only supports the typed-schema subset (unsupported keywords fail with `invalid_request`). `@smart-llm/core` validates the parsed answer.
+- **Reasoning**: maps `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`):
+  - `gemini-2.*` models: `thinkingBudget` (`0` for `none`; at least `128` on `gemini-2.5-pro`)
+  - Gemma models: `thinkingLevel` `MINIMAL` for `none` to `low`, `HIGH` for `medium` to `max`
+  - other models: `thinkingLevel`; `none` and `minimal` send `MINIMAL` on Gemini 3.0 to 3.6 Flash and Flash-Lite and `LOW` on others; `xhigh` and `max` send `HIGH`
+  - thought summaries return in `data.reasoning`: `includeThoughts: true` is sent whenever `reasoning_effort` is set, except when `none` sends `thinkingBudget: 0`; turn off with `extra: { config: { thinkingConfig: { includeThoughts: false } } }`
+  - assistant `reasoning` in the history is not sent
+- **Web search**: `web_search: true` enables Google Search grounding; citations return in `data.sources` (`{ url, title? }`).
+- **Batch**: `batch: true` groups calls that arrive within `batchWaitSec` and share `model`, `config`, `response_format`, and `tools` into one Gemini Batch API job; Vertex AI needs `vertex.bucket` or env `VERTEX_BATCH_BUCKET`. Jobs are polled every 30 s for up to 72 hours, then fail with non-retryable `timeout`. A group above the payload limit is split into several jobs; a single request above it fails with `invalid_request`.
+- **Embeddings**: `task` (`'query'`, `'document'`, `'similarity'`, `'classification'`, `'clustering'`) maps to Gemini task types; per-input `title` requires `task: 'document'`; `dimensions` is supported. `usage.inputTokens` is always `null`.
+  - up to `100` texts per call (`maxEmbedInputs: 100`) on the Developer API, and on Vertex AI for `gemini-embedding-001` and non-Gemini (non-MaaS) models
+  - Vertex AI with other Gemini models (including `gemini-embedding-2`) and MaaS models: more than `1` text per call returns `unsupported`; set `capabilities: { embeddings: { supported: true, maxInputs: 1 } }` so `llm.embed` sends one text per call
+  - models other than `gemini-embedding-2` take one `title` per call; different titles fail with `invalid_request`
+- **Model listing**: `llm.listModels('gemini')` returns `{ id, displayName?, inputTokenLimit?, outputTokenLimit? }[]` (Vertex AI publisher models populate `id` only).
 
-Full documentation of configuration, requests, rate limits, and error handling is available in the [smart-llm README](https://github.com/martin-winkler-dev/smart-llm-js#readme).
+## Errors
+
+| Code | Retryable | When |
+|---|---|---|
+| `rate_limited` | yes | HTTP 429 (`retry-after` honored) |
+| `http` | yes / no | HTTP errors (`status` and `retryAfterMs` preserved) |
+| `network` | yes | Connection failure |
+| `timeout` | yes | Request timed out |
+| `timeout` | no | Batch job not finished after 72 hours |
+| `aborted` | no | Caller `signal` aborted |
+| `blocked` / `truncated` | no | Safety block / token limit; carries `error.output` |
+| `invalid_request` | no | Invalid `extra.config`, request limits under Capabilities, `tools` with `web_search: true` on `gemini-2.*`, oversized batch request, or unsupported Vertex batch schema keywords |
+| `unsupported` | no | Multi-text `embed` on Vertex AI for models limited to one text, or `batch: true` on Vertex AI without `vertex.bucket` / `VERTEX_BATCH_BUCKET` |
+| `unexpected` | yes | Malformed function call (`MALFORMED_FUNCTION_CALL`) |
+| `unexpected` | no | Missing candidate, failed batch job, other tool finish errors, or non-`TypeError` exceptions |
+
+An `invalid_json` answer is parsed and validated by `@smart-llm/core` (or forwarded as `invalid_json` if no output was returned).
+
+## Exports
+
+| Export | Kind | Description |
+|---|---|---|
+| `createGeminiProvider` | function | Creates the adapter |
+| `GEMINI_SUPPORT` | constant | `LlmProviderSupport` of the adapter |
+| `GEMINI_API_KEY_ENV` | constant | `'GEMINI_API_KEY'` (re-exported from smart-genai) |
+| `GeminiOptions` | type | Options of `createGeminiProvider` |
+| `GeminiExtra` | type | `extra` accepted by the adapter |
+
+Configuration, requests, rate limits, and error handling of `@smart-llm/core` are documented in the [smart-llm README](https://github.com/martin-winkler-dev/smart-llm-js#readme).
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).

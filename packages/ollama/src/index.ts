@@ -9,7 +9,7 @@ import type {
     LlmProviderSupport,
     Result,
 } from '@smart-llm/core';
-import { createOpenAiCompatibleProvider, fetchJson } from '@smart-llm/openai-compatible';
+import { callerAbortError, createOpenAiCompatibleProvider, fetchJson } from '@smart-llm/openai-compatible';
 
 // -------------------------------------------------------------------
 // --- 1. Types
@@ -19,6 +19,7 @@ import { createOpenAiCompatibleProvider, fetchJson } from '@smart-llm/openai-com
  * **Ollama provider options**.
  *
  * - `baseUrl`: OpenAI-compatible endpoint URL (defaults to `http://localhost:11434/v1`)
+ * - `apiKey`: optional bearer token (authenticated reverse proxies)
  * - `timeoutMs`: request timeout in milliseconds (defaults to 10 min)
  * - `fetch`: optional custom fetch implementation
  */
@@ -28,11 +29,12 @@ export type OllamaOptions = { baseUrl?: string; apiKey?: string; timeoutMs?: num
  * **Options for `fetchOllamaCapabilities`**.
  *
  * - `baseUrl`: server endpoint URL
+ * - `apiKey`: optional bearer token (authenticated reverse proxies)
  * - `signal`: abort signal
  * - `timeoutMs`: request timeout (defaults to 30 s)
  * - `fetch`: optional custom fetch implementation
  */
-export type OllamaCapabilitiesOptions = Pick<OllamaOptions, 'baseUrl' | 'fetch' | 'timeoutMs'> & {
+export type OllamaCapabilitiesOptions = Pick<OllamaOptions, 'baseUrl' | 'apiKey' | 'fetch' | 'timeoutMs'> & {
     signal?: AbortSignal;
 };
 
@@ -52,8 +54,8 @@ const DEFAULT_TAGS_TIMEOUT_MS = 30_000;
 /** Error message when `/api/tags` response lacks valid model list. */
 const NO_MODEL_LIST = 'The /api/tags response is not a model list';
 
-/** Trailing /v1 endpoint path pattern. */
-const MATCH_V1_SUFFIX = /\/v1\/?$/;
+/** Trailing `/v1` endpoint path and trailing slashes (both optional). */
+const MATCH_V1_SUFFIX = /(?:\/+v1)?\/*$/;
 
 /** Capabilities supported by Ollama: images, tools, reasoning, grammar-based JSON format, and embeddings. */
 export const OLLAMA_SUPPORT: LlmProviderSupport = {
@@ -93,7 +95,9 @@ export function createOllamaProvider(options: OllamaOptions = {}): LlmProvider {
  * **Fetches installed model capabilities from Ollama server** (`GET /api/tags`).
  *
  * - queries model tags and maps reported capabilities (`vision`, `tools`, `thinking`, `embedding`)
- * - strips `/v1` suffix from base URL
+ * - strips `/v1` suffix and trailing slashes from base URL
+ * - sends `apiKey` as bearer token when set
+ * - reports caller `signal` abort as `aborted`, internal `timeoutMs` as `timeout`
  * - returns result error on failure instead of throwing
  */
 export async function fetchOllamaCapabilities(
@@ -103,30 +107,34 @@ export async function fetchOllamaCapabilities(
         const root = (options.baseUrl ?? OLLAMA_BASE_URL).replace(MATCH_V1_SUFFIX, '');
         const timeout = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TAGS_TIMEOUT_MS);
         const sent = await fetchJson(options.fetch ?? fetch, `${root}/api/tags`, {
+            ...(options.apiKey === undefined ? {} : { headers: { authorization: `Bearer ${options.apiKey}` } }),
             signal: options.signal === undefined ? timeout : AbortSignal.any([options.signal, timeout]),
         });
         if (!sent.ok) {
-            return sent;
+            return { ok: false, error: callerAbortError(sent.error, options.signal) };
         }
         const models = (sent.data as { models?: unknown } | null)?.models ?? [];
         if (!Array.isArray(models)) {
             return { ok: false, error: { code: 'unexpected', message: NO_MODEL_LIST, retryable: false } };
         }
-        const result: Record<string, LlmModelCapabilities> = {};
+        const entries: [string, LlmModelCapabilities][] = [];
         for (const model of models as { name?: unknown; capabilities?: unknown }[]) {
             const name = model?.name;
             if (typeof name !== 'string') {
                 return { ok: false, error: { code: 'unexpected', message: NO_MODEL_LIST, retryable: false } };
             }
             const reported: unknown[] = Array.isArray(model.capabilities) ? model.capabilities : [];
-            result[name] = {
-                ...(reported.includes('vision') ? { images: true } : {}),
-                ...(reported.includes('tools') ? { tools: true } : {}),
-                ...(reported.includes('thinking') ? { reasoning: { supported: true } } : {}),
-                ...(reported.includes('embedding') ? { embeddings: true } : {}),
-            };
+            entries.push([
+                name,
+                {
+                    ...(reported.includes('vision') ? { images: true } : {}),
+                    ...(reported.includes('tools') ? { tools: true } : {}),
+                    ...(reported.includes('thinking') ? { reasoning: { supported: true } } : {}),
+                    ...(reported.includes('embedding') ? { embeddings: true } : {}),
+                },
+            ]);
         }
-        return { ok: true, data: result };
+        return { ok: true, data: Object.fromEntries(entries) };
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { ok: false, error: { code: 'unexpected', message, retryable: false } };

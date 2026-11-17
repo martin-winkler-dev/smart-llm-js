@@ -7,6 +7,7 @@ const pkg = require('@smart-llm/openai-compatible');
 assert.equal(typeof pkg.createOpenAiCompatibleProvider, 'function');
 assert.equal(typeof pkg.statusError, 'function');
 assert.equal(typeof pkg.fetchJson, 'function');
+assert.equal(typeof pkg.callerAbortError, 'function');
 
 const err = pkg.statusError(404, 'not found', null);
 assert.equal(err.code, 'http');

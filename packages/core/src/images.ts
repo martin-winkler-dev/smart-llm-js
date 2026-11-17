@@ -18,24 +18,40 @@ const MIME_TYPES: Readonly<Record<string, string>> = {
     '.gif': 'image/gif',
 };
 
+/** Image MIME type pattern: `image/<subtype>`, any case, no parameters. */
+const MATCH_IMAGE_TYPE = /^image\/[\w.+-]+$/i;
+
+/** Values of image `detail`; also used by request validation. */
+export const IMAGE_DETAILS: ReadonlySet<unknown> = new Set(['auto', 'low', 'high']);
+
 // -------------------------------------------------------------------
 // --- 2. Exported Functions
 // -------------------------------------------------------------------
 
 /**
- * Formats image byte buffer as OpenAI image part (base64 data URL).
- * @throws {TypeError} If `mimeType` does not start with `image/`.
+ * Creates an image content part from a binary buffer.
+ * @throws {TypeError} If data is empty/non-buffer, mimeType is not an image type, or detail is invalid.
  */
 export function imagePart(
     data: Uint8Array | ArrayBuffer,
     mimeType: string,
     detail?: 'auto' | 'low' | 'high',
 ): LlmImagePart {
-    if (!mimeType.startsWith('image/')) {
+    if (!isByteBuffer(data)) {
+        throw new TypeError('Invalid value for option "data": a Uint8Array, Buffer or ArrayBuffer');
+    }
+    if (typeof mimeType !== 'string' || !MATCH_IMAGE_TYPE.test(mimeType)) {
         throw new TypeError('Invalid value for option "mimeType": an image type such as image/png');
     }
+    if (detail !== undefined && !IMAGE_DETAILS.has(detail)) {
+        throw new TypeError('Invalid value for option "detail": auto, low or high');
+    }
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    const url = `data:${mimeType};base64,${Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')}`;
+    if (bytes.byteLength === 0) {
+        throw new TypeError('Invalid value for option "data": non-empty image bytes');
+    }
+    const base64 = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
+    const url = `data:${mimeType.toLowerCase()};base64,${base64}`;
     const image = detail === undefined ? { url } : { url, detail };
     return {
         type: 'image_url',
@@ -54,4 +70,17 @@ export async function imageFromFile(path: string, mimeType?: string): Promise<Ll
         throw new TypeError(`Invalid value for option "path": unknown image type of ${path}`);
     }
     return imagePart(await readFile(path), type);
+}
+
+// -------------------------------------------------------------------
+// --- 3. Private Functions
+// -------------------------------------------------------------------
+
+/** Checks whether value is a byte array or an array buffer. */
+function isByteBuffer(value: unknown): value is Uint8Array | ArrayBuffer {
+    return (
+        value instanceof Uint8Array ||
+        value instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
+    );
 }

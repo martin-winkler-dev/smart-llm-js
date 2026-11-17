@@ -31,6 +31,12 @@ import {
 /** Gemini configuration type for smart-genai. */
 type GenaiConfig = NonNullable<GenaiCallOptions['config']>;
 
+/** Options of `createGeminiProvider`: smart-genai client options without `defaults` (set in `createLlm`). */
+export type GeminiOptions = Omit<GenaiClientOptions, 'defaults'>;
+
+/** Gemini extra options (provider, model, or call `extra`): smart-genai `config`, merged per top-level field. */
+export type GeminiExtra = { config?: GenaiConfig };
+
 // -------------------------------------------------------------------
 // --- 2. Constants
 // -------------------------------------------------------------------
@@ -58,6 +64,9 @@ const EMBED_TASK_TYPES: Readonly<Record<LlmEmbedTask, GenaiEmbedTask>> = {
     clustering: 'CLUSTERING',
 };
 
+/** Environment variable name for Gemini Developer API key. */
+export { GEMINI_API_KEY_ENV } from 'smart-genai';
+
 // -------------------------------------------------------------------
 // --- 3. Exported Functions
 // -------------------------------------------------------------------
@@ -69,9 +78,10 @@ const EMBED_TASK_TYPES: Readonly<Record<LlmEmbedTask, GenaiEmbedTask>> = {
  * - forwards `extra.config` to smart-genai configuration
  * - strips assistant reasoning history before sending
  * - embeds up to 100 texts per call mapping tasks to Gemini task types
+ * - smart-genai `invalid_json` with output: returns output as answer, so core parses and validates JSON
  * @throws {TypeError} If client options contain `defaults`.
  */
-export function createGeminiProvider(client: GenaiClient | Omit<GenaiClientOptions, 'defaults'> = {}): LlmProvider {
+export function createGeminiProvider(client: GenaiClient | GeminiOptions = {}): LlmProvider {
     const genai = toGenaiClient(client);
     return {
         name: 'gemini',
@@ -86,11 +96,15 @@ export function createGeminiProvider(client: GenaiClient | Omit<GenaiClientOptio
                 }
                 const result = await genai.generate(toGenaiRequest(request), options);
                 if (!result.ok) {
+                    // leave JSON parsing to core: one message and fence rule for every provider
+                    if (result.error.code === 'invalid_json' && result.error.output !== undefined) {
+                        return { ok: true, data: toProviderOutput(result.error.output) };
+                    }
                     return { ok: false, error: toProviderError(result.error) };
                 }
                 return { ok: true, data: toProviderOutput(result.data) };
             } catch (error) {
-                return { ok: false, error: thrownError(error) };
+                return { ok: false, error: mapThrownError(error) };
             }
         },
         maxEmbedInputs: MAX_EMBED_INPUTS,
@@ -111,7 +125,7 @@ export function createGeminiProvider(client: GenaiClient | Omit<GenaiClientOptio
                 const { embeddings, model, ms } = result.data;
                 return { ok: true, data: { embeddings, model, usage: { inputTokens: null }, ms } };
             } catch (error) {
-                return { ok: false, error: thrownError(error) };
+                return { ok: false, error: mapThrownError(error) };
             }
         },
         async listModels(options = {}) {
@@ -131,7 +145,7 @@ export function createGeminiProvider(client: GenaiClient | Omit<GenaiClientOptio
                     })),
                 };
             } catch (error) {
-                return { ok: false, error: thrownError(error) };
+                return { ok: false, error: mapThrownError(error) };
             }
         },
     };
@@ -145,7 +159,7 @@ export function createGeminiProvider(client: GenaiClient | Omit<GenaiClientOptio
  * Resolves smart-genai client from instance or options.
  * @throws {TypeError} If options contain `defaults`.
  */
-function toGenaiClient(client: GenaiClient | Omit<GenaiClientOptions, 'defaults'>): GenaiClient {
+function toGenaiClient(client: GenaiClient | GeminiOptions): GenaiClient {
     if (typeof (client as Partial<GenaiClient>).generate === 'function') {
         return client as GenaiClient;
     }
@@ -170,16 +184,43 @@ function validateGeminiExtra(extra: Record<string, unknown>, option: string): vo
     }
 }
 
-/** Merges extra options across layers with deep merge for `config`. */
+/**
+ * **Merges extra options across layers**: `config` per top-level field (later layers win).
+ *
+ * - nested objects other than `thinkingConfig` are replaced whole; `thinkingConfig` merges per member
+ * - `thinkingBudget` and `thinkingLevel` count as one setting: last layer setting either wins
+ * - earlier layers lose both keys; other `thinkingConfig` members (`includeThoughts`) still merge
+ */
 function mergeGeminiExtra(layers: Record<string, unknown>[]): Record<string, unknown> {
     const merged: Record<string, unknown> = Object.assign({}, ...layers);
-    const config = mergeGenaiConfig(...layers.map((layer) => layer.config as GenaiConfig | undefined));
+    const configs = layers.map((layer) => layer.config as GenaiConfig | undefined);
+    const last = configs.findLastIndex(setsThinking);
+    const config = mergeGenaiConfig(
+        ...configs.map((layerConfig, index) => (index < last ? withoutThinkingSetting(layerConfig) : layerConfig)),
+    );
     if (config === undefined) {
         delete merged.config;
     } else {
         merged.config = config;
     }
     return merged;
+}
+
+/** Checks whether config sets `thinkingBudget` or `thinkingLevel`; `thinkingConfig: null` sets neither. */
+function setsThinking(config: GenaiConfig | undefined): boolean {
+    const thinking = config?.thinkingConfig;
+    return thinking?.thinkingBudget !== undefined || thinking?.thinkingLevel !== undefined;
+}
+
+/** Copies config without `thinkingBudget` and `thinkingLevel`; drops `thinkingConfig` if nothing remains. */
+function withoutThinkingSetting(config: GenaiConfig | undefined): GenaiConfig | undefined {
+    // smart-genai accepts `thinkingConfig: null`: nothing to strip
+    if (typeof config?.thinkingConfig !== 'object' || config.thinkingConfig === null) {
+        return config;
+    }
+    const { thinkingConfig, ...rest } = config;
+    const { thinkingBudget: _budget, thinkingLevel: _level, ...thinking } = thinkingConfig;
+    return Object.keys(thinking).length === 0 ? rest : { ...rest, thinkingConfig: thinking };
 }
 
 /** Strips wrapper metadata from smart-genai output. */
@@ -195,7 +236,7 @@ function toProviderError(error: GenaiError): LlmProviderError {
 }
 
 /** Maps uncaught smart-genai exception to `invalid_request` or `unexpected` error. */
-function thrownError(error: unknown): LlmError {
+function mapThrownError(error: unknown): LlmError {
     const message = error instanceof Error ? error.message : String(error);
     return { code: error instanceof TypeError ? 'invalid_request' : 'unexpected', message, retryable: false };
 }

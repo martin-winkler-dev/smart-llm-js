@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'bun:test';
+import { createRPM } from 'smart-limit';
 import { imagePart } from '../src/images.js';
 import { estimateTokens } from '../src/limits.js';
 import { createLlm } from '../src/llm.js';
@@ -18,7 +19,7 @@ const schema = {
 };
 
 describe('createLlm', () => {
-    it('routes a request by model name, so the same request reaches another provider', async () => {
+    it('routes requests by model name across providers', async () => {
         const gemini = createFakeProvider('gemini');
         const local = createFakeProvider('local');
         const llm = createLlm({
@@ -40,7 +41,7 @@ describe('createLlm', () => {
         expect(await llm.listModels('local')).toEqual({ ok: true, data: [{ id: 'local-model' }] });
     });
 
-    it('fills defaults lowest first: shared, provider, model, request; extra merges the same way', async () => {
+    it('merges defaults and extra in order: shared, provider, model, request', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             defaults: { temperature: 0, top_p: 0.5, seed: 1 },
@@ -59,7 +60,7 @@ describe('createLlm', () => {
         expect(call?.extra).toEqual({ a: 1, b: 2, c: 3 });
     });
 
-    it('fails with unsupported for what a model does not declare, even when its adapter supports it', async () => {
+    it('returns unsupported for undeclared model capabilities even if adapter supports them', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ providers: { p: { adapter, models: { small: 'small' } } } });
         const image = imagePart(new Uint8Array([1, 2, 3]), 'image/png');
@@ -101,7 +102,7 @@ describe('createLlm', () => {
         });
     });
 
-    it('takes a capability default when a call does not set the field; explicit off is sent as off', async () => {
+    it('applies capability defaults when omitted and forwards explicit off', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: {
@@ -185,7 +186,7 @@ describe('createLlm', () => {
         ]);
     });
 
-    it('createLlm throws a TypeError for a capability the adapter lacks or an invalid default', () => {
+    it('throws TypeError for unsupported adapter capabilities or invalid defaults', () => {
         const plain = createFakeProvider('plain', {});
         const full = createFakeProvider();
         const invalid: [unknown, unknown, RegExp][] = [
@@ -220,7 +221,7 @@ describe('createLlm', () => {
         expect(full.calls).toHaveLength(0);
     });
 
-    it('createLlm throws a TypeError for defaults that moved to capabilities or to each call', () => {
+    it('throws TypeError for options disallowed in defaults', () => {
         const adapter = createFakeProvider();
         const moved: [Record<string, unknown>, RegExp][] = [
             [
@@ -250,7 +251,7 @@ describe('createLlm', () => {
 });
 
 describe('model functions', () => {
-    it('llm.<name>(input, options): input is what is sent, options every request field plus signal and extra', async () => {
+    it('sends input and options via llm.<name>(input, options)', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: {
@@ -292,7 +293,7 @@ describe('model functions', () => {
         expect(adapter.calls[1]?.request).toEqual({ model: 'm', messages: conversation, max_tokens: 10 });
     });
 
-    it('works as a detached function, so a model can be handed on with its name and options fixed', async () => {
+    it('works as a detached function', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ providers: { p: { adapter, models: { a: 'model-a', b: 'model-b' } } } });
         function pick(call: LlmModelCall) {
@@ -313,7 +314,7 @@ describe('model functions', () => {
         expect(Object.keys(llm)).toEqual(['models', 'generate', 'embed', 'listModels', 'a', 'b']);
     });
 
-    it('fails with invalid_request instead of throwing, with the model and provider names', async () => {
+    it('returns invalid_request with model and provider names instead of throwing', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ providers: { p: { adapter, models: { m: 'm' } } } });
         const cases: [Promise<unknown>, RegExp][] = [
@@ -344,7 +345,7 @@ describe('model functions', () => {
         expect(adapter.calls).toHaveLength(0);
     });
 
-    it('an option set to undefined keeps the default; an empty options object changes nothing', async () => {
+    it('preserves defaults when option is undefined or options object is empty', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             defaults: { temperature: 0.3, max_tokens: 100 },
@@ -360,7 +361,7 @@ describe('model functions', () => {
         ]);
     });
 
-    it('takes a JSON schema in the options and answers its json', async () => {
+    it('parses json when response_format is passed in options', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: true } } } } },
@@ -375,7 +376,7 @@ describe('model functions', () => {
         expect(adapter.calls[0]?.request.response_format).toEqual(format);
     });
 
-    it('runs a tool loop: tools in the options, the conversation with assistantMessage and toolMessage as input', async () => {
+    it('supports tool loop with assistantMessage and toolMessage', async () => {
         const adapter = createFakeProvider();
         const call: LlmToolCall = { id: 'c1', type: 'function', function: { name: 'f', arguments: '{"x":1}' } };
         adapter.reply(
@@ -418,7 +419,7 @@ describe('model functions', () => {
         });
     });
 
-    it('rejects reserved model names at creation and keeps odd names as own members', async () => {
+    it('rejects reserved model names and defines custom names as own properties', async () => {
         const adapter = createFakeProvider();
         const reserved = [
             'generate',
@@ -443,6 +444,16 @@ describe('model functions', () => {
         expect(await llm['ds-flash']?.('hi')).toMatchObject({ ok: true, data: { model: 'dash-model' } });
         expect(await llm['flash.v2']?.('hi')).toMatchObject({ ok: true, data: { model: 'dot-model' } });
         expect(JSON.parse(JSON.stringify({ llm })).llm.models).toHaveLength(2);
+    });
+
+    it('rejects empty provider and model names at creation', () => {
+        const adapter = createFakeProvider();
+        expect(() => createLlm({ providers: { '': { adapter, models: { m: 'm' } } } })).toThrow(
+            new TypeError('Invalid value for option "providers": an empty provider name'),
+        );
+        expect(() => createLlm({ providers: { p: { adapter, models: { '': 'm' } } } })).toThrow(
+            new TypeError('Invalid value for option "providers.p.models": an empty model name'),
+        );
     });
 });
 
@@ -502,19 +513,267 @@ describe('JSON answers', () => {
         expect(sent?.messages[2]).toEqual(messages[0] as LlmMessage);
     });
 
-    it('prompt (forced on a model of a strict adapter): JSON mode, schema in the prompt, retries', async () => {
+    it('prompt: injects schema, sends json_object, and strips code fences', async () => {
         const adapter = createFakeProvider('p', { json: 'strict' });
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: 'prompt' } } } } },
         });
-        adapter.reply(answer('not json'), answer('{"kind":"x"}'), answer('```json\n{"kind":"noun"}\n```'));
+        adapter.reply(answer('```json\n{"kind":"noun"}\n```'));
         expect(await llm.generate({ model: 'm', messages, response_format: format })).toMatchObject({
             ok: true,
             data: { json: { kind: 'noun' } },
         });
-        expect(adapter.calls).toHaveLength(3);
+        expect(adapter.calls).toHaveLength(1);
         expect(adapter.calls[0]?.request.response_format).toEqual({ type: 'json_object' });
         expect(String(adapter.calls[0]?.request.messages[0]?.content)).toContain('JSON Schema');
+    });
+
+    it('prompt: fails on schema mismatch without retrying in normal and batch calls', async () => {
+        for (const batch of [false, true]) {
+            const adapter = createFakeProvider();
+            const llm = createLlm({
+                limiterOptions: { maxRetries: 2, retryDelayMs: 1 },
+                providers: {
+                    p: {
+                        adapter,
+                        models: { m: { model: 'm', capabilities: { json: 'prompt', batch: { supported: true } } } },
+                    },
+                },
+            });
+            adapter.reply(answer('{"kind":"x"}'), answer('{"kind":"noun"}'));
+            expect(await llm.generate({ model: 'm', messages, response_format: format, batch })).toMatchObject({
+                ok: false,
+                error: { code: 'invalid_json', retryable: false, attempts: 1 },
+            });
+            expect(adapter.calls).toHaveLength(1);
+        }
+    });
+
+    it('json_object: rejects non-object JSON with invalid_json', async () => {
+        const adapter = createFakeProvider('p', { json: 'prompt' });
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: true } } } } },
+        });
+        for (const text of ['123', 'null', '[1,2]', '"hi"', 'true']) {
+            adapter.reply(answer(text));
+            expect(
+                await llm.generate({ model: 'm', messages, response_format: { type: 'json_object' } }),
+            ).toMatchObject({
+                ok: false,
+                error: {
+                    code: 'invalid_json',
+                    message: 'The answer is not a JSON object',
+                    retryable: false,
+                    output: { json: JSON.parse(text) },
+                },
+            });
+        }
+        adapter.reply(answer('{"a":1}'));
+        expect(await llm.generate({ model: 'm', messages, response_format: { type: 'json_object' } })).toMatchObject({
+            ok: true,
+            data: { json: { a: 1 } },
+        });
+    });
+
+    it('json_schema without schema: rejects non-object JSON with invalid_json', async () => {
+        const adapter = createFakeProvider('p', { json: 'native' });
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: true } } } } },
+        });
+        adapter.reply(answer('[1,2]'));
+        const free = { type: 'json_schema' as const, json_schema: { name: 'free' } };
+        expect(await llm.generate({ model: 'm', messages, response_format: free })).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_json', message: 'The answer is not a JSON object', output: { json: [1, 2] } },
+        });
+        expect(adapter.calls[0]?.request.response_format).toEqual({ type: 'json_object' });
+    });
+
+    it('text: answers plain text and does not forward response_format', async () => {
+        const adapter = createFakeProvider();
+        const llm = createLlm({ providers: { p: { adapter, models: { m: 'm' } } } });
+        adapter.reply(answer('[1]'));
+        expect(await llm.generate({ model: 'm', messages, response_format: { type: 'text' } })).toMatchObject({
+            ok: true,
+            data: { text: '[1]' },
+        });
+        expect(adapter.calls[0]?.request).toEqual({ model: 'm', messages });
+    });
+
+    it('fails with invalid_request for a malformed response_format before any call', async () => {
+        const adapter = createFakeProvider('p', { json: 'native', tools: true });
+        const llm = createLlm({
+            providers: {
+                p: { adapter, models: { m: { model: 'm', capabilities: { json: true, tools: true } } } },
+            },
+        });
+        /** Creates json_schema format with name `w` and given fields. */
+        function spec(fields: Record<string, unknown>) {
+            return { type: 'json_schema', json_schema: { name: 'w', ...fields } };
+        }
+        const invalid: [unknown, string][] = [
+            [{ type: 'json_object', schema }, 'Option "response_format.schema" is not supported'],
+            [{ type: 'text', strict: true }, 'Option "response_format.strict" is not supported'],
+            [{ type: 'xml' }, 'Invalid value for option "response_format"'],
+            [{ type: 'json_schema' }, 'Invalid value for option "response_format.json_schema"'],
+            [spec({ foo: 1 }), 'Option "response_format.json_schema.foo" is not supported'],
+            [spec({ name: '' }), 'Invalid value for option "response_format.json_schema.name"'],
+            [spec({ name: 'a b' }), 'Invalid value for option "response_format.json_schema.name"'],
+            [spec({ description: 1 }), 'Invalid value for option "response_format.json_schema.description"'],
+            [spec({ strict: 'yes' }), 'Invalid value for option "response_format.json_schema.strict"'],
+            [spec({ schema: [] }), 'Invalid value for option "response_format.json_schema.schema": a JSON Schema'],
+            [
+                spec({ schema: { type: 'object', properties: null } }),
+                'Invalid value for option "response_format.json_schema.schema.properties"',
+            ],
+            [
+                spec({ schema: { type: 'object', properties: { a: null } } }),
+                'Invalid value for option "response_format.json_schema.schema.properties.a": a JSON Schema object',
+            ],
+            [
+                spec({ schema: { type: 'array', items: { properties: { a: { items: 1 } } } } }),
+                'Invalid value for option "response_format.json_schema.schema.items.properties.a.items"',
+            ],
+        ];
+        for (const [format, message] of invalid) {
+            expect(await llm.generate({ model: 'm', messages, response_format: format as never })).toMatchObject({
+                ok: false,
+                error: { code: 'invalid_request', message: expect.stringContaining(message), retryable: false },
+            });
+        }
+        const parameters = { type: 'object', properties: { city: 'string' } };
+        expect(
+            await llm.generate({
+                model: 'm',
+                messages,
+                tools: [{ type: 'function', function: { name: 'f', parameters } }],
+            }),
+        ).toMatchObject({
+            ok: false,
+            error: {
+                code: 'invalid_request',
+                message:
+                    'Invalid value for option "tools.function.parameters.properties.city": a JSON Schema object or boolean',
+            },
+        });
+        expect(adapter.calls).toHaveLength(0);
+        const valid = spec({ schema, description: 'A word', strict: null });
+        expect(await llm.generate({ model: 'm', messages, response_format: valid as never })).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_json' },
+        });
+        expect(adapter.calls).toHaveLength(1);
+    });
+
+    it('accepts boolean/array sub-schemas and rejects invalid or circular schemas', async () => {
+        const adapter = createFakeProvider('p', { json: 'native' });
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: true } } } } },
+        });
+        adapter.reply(answer('{}'));
+        /** Generates with json_schema format of given schema. */
+        function run(value: unknown) {
+            const format = { type: 'json_schema', json_schema: { name: 'w', schema: value } };
+            return llm.generate({ model: 'm', messages, response_format: format as never });
+        }
+        const object = { type: 'object', properties: { a: { type: 'string' } } };
+        const valid: unknown[] = [
+            { $defs: { node: object }, $ref: '#/$defs/node' },
+            { anyOf: [object, { type: 'null' }] },
+            { type: 'object', additionalProperties: object },
+            { type: 'array', prefixItems: [object], items: object },
+            { type: 'array', items: [object, { type: 'number' }] },
+            { type: 'array', items: false },
+            { type: 'object', properties: { p: true } },
+            { type: 'object', properties: { a: object, b: object } },
+        ];
+        for (const value of valid) {
+            // the fixed answer `{}` may not match the schema; only request validation is checked here
+            const result = await run(value);
+            expect(['ok', 'invalid_json']).toContain(result.ok ? 'ok' : result.error.code);
+        }
+        const cyclic: Record<string, unknown> = { type: 'object' };
+        cyclic.properties = { self: cyclic };
+        const path = 'Invalid value for option "response_format.json_schema.schema';
+        const invalid: [unknown, string][] = [
+            [{ properties: { p: null } }, `${path}.properties.p": a JSON Schema object or boolean`],
+            [{ properties: { p: 1 } }, `${path}.properties.p": a JSON Schema object or boolean`],
+            [{ items: 'string' }, `${path}.items": a JSON Schema object or boolean`],
+            [{ items: [object, null] }, `${path}.items.1": a JSON Schema object or boolean`],
+            [cyclic, `${path}.properties.self": a JSON Schema without circular references`],
+        ];
+        for (const [value, message] of invalid) {
+            expect(await run(value)).toMatchObject({ ok: false, error: { code: 'invalid_request', message } });
+        }
+        expect(adapter.calls).toHaveLength(valid.length);
+    });
+
+    it('checks sub-schemas under combinator, conditional, map and tuple keywords', async () => {
+        const adapter = createFakeProvider('p', { json: 'native' });
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { json: true } } } } },
+        });
+        adapter.reply(answer('{}'));
+        /** Generates with json_schema format of given schema. */
+        function run(value: unknown) {
+            const format = { type: 'json_schema', json_schema: { name: 'w', schema: value } };
+            return llm.generate({ model: 'm', messages, response_format: format as never });
+        }
+        const object = { type: 'object', properties: { a: { type: 'string' } } };
+        const valid: unknown[] = [
+            { type: 'object', anyOf: [object, true], oneOf: [object], allOf: [object, object] },
+            { $defs: { A: object, B: false }, definitions: { C: object }, anyOf: [{ $ref: '#/$defs/A' }] },
+            { type: 'object', patternProperties: { '^x': object }, propertyNames: { pattern: '^[a-z]+$' } },
+            { type: 'array', contains: object, prefixItems: [object, true] },
+            // biome-ignore lint/suspicious/noThenProperty: JSON Schema `then` keyword is the case under test
+            { if: object, then: object, else: false, not: { type: 'null' } },
+            { type: 'object', properties: { enum: { enum: [null] }, anyOf: { type: 'string' } } },
+            { type: 'object', default: { anyOf: null }, examples: [{ items: null }] },
+        ];
+        for (const value of valid) {
+            const result = await run(value);
+            expect(['ok', 'invalid_json']).toContain(result.ok ? 'ok' : result.error.code);
+        }
+        const cyclic: Record<string, unknown> = { type: 'object' };
+        cyclic.$defs = { R: { anyOf: [cyclic] } };
+        const path = 'Invalid value for option "response_format.json_schema.schema';
+        const schemaOrBoolean = 'a JSON Schema object or boolean';
+        const invalid: [unknown, string][] = [
+            [{ type: 'object', anyOf: [null] }, `${path}.anyOf.0": ${schemaOrBoolean}`],
+            [{ $defs: { R: null } }, `${path}.$defs.R": ${schemaOrBoolean}`],
+            [{ anyOf: {} }, `${path}.anyOf": an array of JSON Schemas`],
+            [{ oneOf: [object, 1] }, `${path}.oneOf.1": ${schemaOrBoolean}`],
+            [{ allOf: object }, `${path}.allOf": an array of JSON Schemas`],
+            [{ prefixItems: { 0: object } }, `${path}.prefixItems": an array of JSON Schemas`],
+            [{ definitions: [object] }, `${path}.definitions": an object of JSON Schemas`],
+            [{ patternProperties: { '^x': 'string' } }, `${path}.patternProperties.^x": ${schemaOrBoolean}`],
+            [{ properties: [object] }, `${path}.properties": an object of JSON Schemas`],
+            [{ additionalProperties: null }, `${path}.additionalProperties": ${schemaOrBoolean}`],
+            [{ not: [] }, `${path}.not": ${schemaOrBoolean}`],
+            [{ contains: 'x' }, `${path}.contains": ${schemaOrBoolean}`],
+            // biome-ignore lint/suspicious/noThenProperty: JSON Schema `then` keyword is the case under test
+            [{ if: object, then: null }, `${path}.then": ${schemaOrBoolean}`],
+            [{ else: 0 }, `${path}.else": ${schemaOrBoolean}`],
+            [{ propertyNames: [] }, `${path}.propertyNames": ${schemaOrBoolean}`],
+            [
+                { anyOf: [{ properties: { a: { allOf: [null] } } }] },
+                `${path}.anyOf.0.properties.a.allOf.0": ${schemaOrBoolean}`,
+            ],
+            [cyclic, `${path}.$defs.R.anyOf.0": a JSON Schema without circular references`],
+        ];
+        for (const [value, message] of invalid) {
+            expect(await run(value)).toMatchObject({ ok: false, error: { code: 'invalid_request', message } });
+        }
+        const parameters = { type: 'object', properties: { a: { oneOf: [null] } } };
+        const tools = [{ type: 'function' as const, function: { name: 'f', parameters } }];
+        expect(await llm.generate({ model: 'm', messages, tools })).toMatchObject({
+            ok: false,
+            error: {
+                code: 'invalid_request',
+                message: `Invalid value for option "tools.function.parameters.properties.a.oneOf.0": ${schemaOrBoolean}`,
+            },
+        });
+        expect(adapter.calls).toHaveLength(valid.length);
     });
 
     it('fails with unsupported for a model without JSON output', async () => {
@@ -550,6 +809,21 @@ describe('tool calls', () => {
         { role: 'assistant', content: null, tool_calls: [toolCall] },
         { role: 'tool', tool_call_id: 'c1', content: '{"sky":"sunny"}' },
     ];
+
+    it('accepts an assistantMessage with reasoning and extra_content followed by a toolMessage', async () => {
+        const adapter = createFakeProvider();
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { tools: true } } } } },
+        });
+        const call: LlmToolCall = { ...toolCall, extra_content: { google: { thought_signature: 'sig' } } };
+        const history: LlmMessage[] = [
+            { role: 'user', content: 'Weather in Graz?' },
+            assistantMessage({ text: '', toolCalls: [call], reasoning: 'look it up' }),
+            toolMessage(call, { sky: 'sunny', id: 1n }),
+        ];
+        expect(await llm.generate({ model: 'm', messages: history, tools })).toMatchObject({ ok: true });
+        expect(adapter.calls[0]?.request.messages).toEqual(history);
+    });
 
     it('passes tools, tool_choice and tool turns through and returns the tool calls without checking JSON', async () => {
         const adapter = createFakeProvider();
@@ -684,7 +958,7 @@ describe('limits', () => {
         expect(adapter.calls).toHaveLength(2);
     });
 
-    it('fails at once on errors that are not retryable, with model and provider names', async () => {
+    it('fails immediately on non-retryable errors with model and provider names', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ providers: { p: { adapter, models: { m: 'm' } } } });
         adapter.reply(failure({ code: 'http', status: 400, message: 'bad', retryable: false }));
@@ -754,7 +1028,7 @@ describe('limits', () => {
         expect(peak).toBe(8);
     });
 
-    it('waits for shared and model limits together; neither overrides the other', async () => {
+    it('enforces both shared and model limits', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             limiterOptions: { maxWaitMs: 100 },
@@ -800,7 +1074,7 @@ describe('limits', () => {
         expect(await once.generate({ model: 'm', messages })).toMatchObject({ ok: false, error: { code: 'timeout' } });
     });
 
-    it('a 429 or an outage that outlasts maxWaitMs ends with the provider error, not limiter', async () => {
+    it('returns provider error when 429 or 5xx backoff exceeds maxWaitMs', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             limiterOptions: { maxWaitMs: 100, maxRetries: 0 },
@@ -822,7 +1096,7 @@ describe('limits', () => {
         });
     });
 
-    it('ends a call with aborted as soon as its signal aborts while it waits for limits or a backoff', async () => {
+    it('aborts immediately when signal fires while waiting on limits or backoff', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'm', modelLimits: { intervalMs: 3000 } } } } },
@@ -847,7 +1121,7 @@ describe('limits', () => {
         expect(Date.now() - started).toBeLessThan(2000);
     });
 
-    it('gives back the token booking of a 429, so its retry fits the same tpm', async () => {
+    it('refunds token booking on 429 so retry fits tpm', async () => {
         const adapter = createFakeProvider();
         adapter.reply(
             failure({ code: 'rate_limited', message: '429', retryable: true, retryAfterMs: 50 }),
@@ -861,7 +1135,7 @@ describe('limits', () => {
         expect(await llm.m('hi', { max_tokens: 10 })).toMatchObject({ ok: true, data: { attempts: 2 } });
     });
 
-    it('starts the calls of one model in call order', async () => {
+    it('dispatches calls for a model in FIFO order', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'm', modelLimits: { concurrency: 1 } } } } },
@@ -871,7 +1145,7 @@ describe('limits', () => {
         expect(adapter.calls.map((call) => call.request.messages[0]?.content)).toEqual(texts);
     });
 
-    it('starts the next call while a retry sleeps in its backoff, in normal and batch calls', async () => {
+    it('dispatches next call while retry is in backoff for normal and batch calls', async () => {
         for (const batch of [false, true]) {
             const adapter = createFakeProvider();
             adapter.reply(failure({ code: 'timeout', message: 'slow', retryable: true }), answer('ok'));
@@ -906,7 +1180,7 @@ describe('limits', () => {
         }
     });
 
-    it('sends one probe after a 429 until it passes, then the waiting calls together', async () => {
+    it('sends single recovery probe after 429 before releasing queued calls', async () => {
         let running = 0;
         const runningAtStart: number[] = [];
         const adapter = createFakeProvider();
@@ -931,7 +1205,7 @@ describe('limits', () => {
         expect(runningAtStart).toEqual([0, 0, 0, 1, 2]);
     });
 
-    it('ends calls without a request while a lock outlasts maxWaitMs, and sends again once it is near', async () => {
+    it('rejects calls without dispatching while lock exceeds maxWaitMs', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             limiterOptions: { maxWaitMs: 100, maxRetries: 0 },
@@ -955,7 +1229,7 @@ describe('limits', () => {
         expect(adapter.calls).toHaveLength(2);
     });
 
-    it('ends an aborted call that waits in the queue at once, without a request', async () => {
+    it('aborts queued call immediately without calling adapter', async () => {
         const adapter = createFakeProvider();
         const base = adapter.generate;
         adapter.generate = async (request, options) => {
@@ -976,7 +1250,7 @@ describe('limits', () => {
 });
 
 describe('batch calls', () => {
-    it('take batch from the call or the capability default, so two names can share one model id', async () => {
+    it('resolves batch flag from call or capability default', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: {
@@ -1000,7 +1274,7 @@ describe('batch calls', () => {
         ]);
     });
 
-    it('fail with unsupported on a model without the batch capability; batch false is always fine', async () => {
+    it('returns unsupported when batch is true on unsupported model', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: {
@@ -1024,7 +1298,7 @@ describe('batch calls', () => {
         expect(adapter.calls.map((call) => call.request)).toEqual([{ model: 'm', messages }]);
     });
 
-    it('wait only for the model concurrency, also longer than maxWaitMs; other limits stay for normal calls', async () => {
+    it('applies only model concurrency to batch calls, ignoring other limits and maxWaitMs', async () => {
         let running = 0;
         let peak = 0;
         const adapter = createFakeProvider();
@@ -1062,7 +1336,7 @@ describe('batch calls', () => {
         });
     });
 
-    it('retry a retryable error per limiterOptions without pausing, and fail a fatal one at once', async () => {
+    it('retries transient batch errors without global pause and fails fatal ones immediately', async () => {
         const adapter = createFakeProvider();
         adapter.reply(
             failure({ code: 'rate_limited', message: 'quota', retryable: true }),
@@ -1093,7 +1367,7 @@ describe('batch calls', () => {
 });
 
 describe('invalid configurations and requests', () => {
-    it('createLlm throws a TypeError before any call', () => {
+    it('throws TypeError on invalid config before any adapter call', () => {
         const adapter = createFakeProvider();
         const invalid: [unknown, RegExp][] = [
             [{ providers: {} }, /option "providers"/],
@@ -1133,6 +1407,58 @@ describe('invalid configurations and requests', () => {
             [{ providers: { p: { adapter, extra: [], models: { m: 'm' } } } }, /providers\.p\.extra/],
             [{ providers: { p: { adapter: { ...adapter, mergeExtra: 1 }, models: { m: 'm' } } } }, /p\.adapter/],
             [{ providers: { p: { adapter, models: { m: 'm' } } }, defaults: { model: 'x' } }, /defaults\.model/],
+            [
+                { providers: { p: { adapter, sharedLimits: { buckets: [null] }, models: { m: 'm' } } } },
+                /option "providers\.p\.sharedLimits\.buckets\.0": a smart-limit bucket with getWaitMs, reserve, settle/,
+            ],
+            [
+                { providers: { p: { adapter, models: { m: { model: 'm', modelLimits: { buckets: [{}] } } } } } },
+                /option "providers\.p\.models\.m\.modelLimits\.buckets\.0": a smart-limit bucket/,
+            ],
+            [
+                {
+                    providers: {
+                        p: { adapter, models: { m: { model: 'm', modelLimits: { buckets: [createRPM(1), 'x'] } } } },
+                    },
+                },
+                /modelLimits\.buckets\.1"/,
+            ],
+            [
+                {
+                    providers: {
+                        p: {
+                            adapter,
+                            sharedLimits: { buckets: [{ ...createRPM(1), subscribe: 1 }] },
+                            models: { m: 'm' },
+                        },
+                    },
+                },
+                /option "providers\.p\.sharedLimits\.buckets\.0\.subscribe": a function/,
+            ],
+            [
+                { providers: { p: { adapter, sharedLimits: { buckets: [createRPM(0)] }, models: { m: 'm' } } } },
+                /option "providers\.p\.sharedLimits\.buckets\.0": \S/,
+            ],
+            [
+                {
+                    providers: {
+                        p: {
+                            adapter,
+                            sharedLimits: {
+                                buckets: [
+                                    Object.defineProperty({ ...createRPM(1) }, 'settle', {
+                                        get() {
+                                            throw new Error('getter failed');
+                                        },
+                                    }),
+                                ],
+                            },
+                            models: { m: 'm' },
+                        },
+                    },
+                },
+                /option "providers\.p\.sharedLimits\.buckets\.0": a smart-limit bucket/,
+            ],
         ];
         for (const [config, message] of invalid) {
             expect(() => createLlm(config as never)).toThrow(message);
@@ -1140,11 +1466,42 @@ describe('invalid configurations and requests', () => {
         expect(adapter.calls).toHaveLength(0);
     });
 
-    it('generate and listModels fail with invalid_request instead of throwing', async () => {
+    it('accepts one smart-limit bucket instance shared by two providers and a model', async () => {
+        const bucket = createRPM(100);
+        const first = createFakeProvider('a');
+        const second = createFakeProvider('b');
+        const llm = createLlm({
+            providers: {
+                a: { adapter: first, sharedLimits: { buckets: [bucket] }, models: { x: 'x' } },
+                b: {
+                    adapter: second,
+                    sharedLimits: { buckets: [bucket] },
+                    models: { y: { model: 'y', modelLimits: { buckets: [bucket] } } },
+                },
+            },
+        });
+        expect(await llm.x('hi')).toMatchObject({ ok: true });
+        expect(await llm.y('hi')).toMatchObject({ ok: true });
+    });
+
+    it('returns invalid_request instead of throwing on invalid generate and listModels calls', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ defaults: { temperature: 0.5 }, providers: { p: { adapter, models: { m: 'm' } } } });
         const image = { type: 'image_url' as const, image_url: { url: 'https://x' } };
+        const cyclicExtra: Record<string, unknown> = {};
+        cyclicExtra.self = { parent: cyclicExtra };
+        const defs: Record<string, unknown> = {};
+        defs.node = { $defs: defs };
+        const cyclicFormat = { type: 'json_schema' as const, json_schema: { name: 'w', schema: { $defs: defs } } };
         const cases: [Promise<unknown>, RegExp][] = [
+            [
+                llm.generate({ model: 'm', messages }, { extra: cyclicExtra }),
+                /option "extra": a value without circular references/,
+            ],
+            [
+                llm.generate({ model: 'm', messages, response_format: cyclicFormat }),
+                /option "response_format\.json_schema\.schema\.\$defs\.node\.\$defs\.node": a JSON Schema without circular/,
+            ],
             [llm.generate(null as never), /option "request"/],
             [llm.generate({ model: 'x' as 'm', messages }), /x is not configured/],
             [llm.generate({ model: 'm', messages, n: 2 } as never), /Option "n" is not supported/],
@@ -1153,6 +1510,9 @@ describe('invalid configurations and requests', () => {
             [llm.generate({ model: 'm', messages }, { extra: [] } as never), /option "extra"/],
             [llm.generate({ model: 'm', messages }, { signal: 'x' } as never), /option "signal"/],
             [llm.listModels('q'), /q is not configured/],
+            [llm.listModels('p', { signal: 'x' } as never), /option "signal"/],
+            [llm.listModels('p', { foo: 1 } as never), /Option "foo" is not supported/],
+            [llm.listModels('p', null as never), /option "options"/],
         ];
         for (const [result, message] of cases) {
             expect(await result).toMatchObject({
@@ -1161,6 +1521,73 @@ describe('invalid configurations and requests', () => {
             });
         }
         expect(adapter.calls).toHaveLength(0);
+    });
+
+    it('returns invalid_request for invalid messages, content parts, and image URLs', async () => {
+        const adapter = createFakeProvider();
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { images: true, tools: true } } } } },
+        });
+        const url = 'data:image/png;base64,AQID';
+        const call = { id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } };
+        /** Creates history of one user message with given content. */
+        function user(content: unknown) {
+            return [{ role: 'user', content }];
+        }
+        const invalid: [unknown[], string][] = [
+            [[{ role: 'user', content: 'x', name: 'bob' }], 'Option "messages.name" is not supported'],
+            [[...messages, { role: 'assistant', content: 'x', refusal: null }], 'Option "messages.refusal"'],
+            [user([]), 'Invalid value for option "messages.content": a string or one or more parts'],
+            [[...messages, { role: 'assistant', content: [] }], 'option "messages.content"'],
+            [
+                [...messages, { role: 'assistant', content: 'hi', tool_calls: [] }],
+                'Invalid value for option "messages.tool_calls": one or more tool calls',
+            ],
+            [
+                [...messages, { role: 'assistant', content: null, tool_calls: [] }],
+                'Invalid value for option "messages.tool_calls": one or more tool calls',
+            ],
+            [user([{ type: 'text', text: 'x', cache: true }]), 'Option "messages.content.cache" is not supported'],
+            [
+                user([{ type: 'image_url', image_url: { url }, text: 'x' }]),
+                'Option "messages.content.text" is not supported',
+            ],
+            [
+                user([{ type: 'image_url', image_url: { url, size: 1 } }]),
+                'Option "messages.content.image_url.size" is not supported',
+            ],
+            [
+                user([{ type: 'image_url', image_url: { url, detail: 'ultra' } }]),
+                'Invalid value for option "messages.content.image_url.detail": auto, low or high',
+            ],
+            [user([{ type: 'image_url', image_url: { url: 'data:image/png;base64,' } }]), 'base64 data URL'],
+            [user([{ type: 'image_url' }]), 'base64 data URL'],
+        ];
+        for (const [turns, message] of invalid) {
+            expect(await llm.generate({ model: 'm', messages: turns as LlmMessage[] })).toMatchObject({
+                ok: false,
+                error: { code: 'invalid_request', message: expect.stringContaining(message), retryable: false },
+            });
+        }
+        expect(adapter.calls).toHaveLength(0);
+        // what assistantMessage and toolMessage build, with provider data in extra_content, stays valid
+        const output = {
+            text: '',
+            reasoning: 'r',
+            toolCalls: [{ ...call, extra_content: { anthropic: { content: [{ type: 'thinking' }] } } } as LlmToolCall],
+        };
+        const valid: LlmMessage[] = [
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: 'x' },
+                    { type: 'image_url', image_url: { url, detail: 'low' } },
+                ],
+            },
+            assistantMessage(output),
+            toolMessage(call, { ok: 1 }),
+        ];
+        expect(await llm.generate({ model: 'm', messages: valid })).toMatchObject({ ok: true });
     });
 
     it('turns a throwing adapter into unexpected', async () => {
@@ -1188,17 +1615,67 @@ describe('invalid configurations and requests', () => {
         });
     });
 
-    it('turns a malformed adapter result into unexpected, not limiter', async () => {
+    it('maps malformed adapter results to unexpected in normal and batch calls', async () => {
         const adapter = createFakeProvider();
-        const llm = createLlm({ providers: { p: { adapter, models: { m: 'm' } } } });
-        const results: unknown[] = [undefined, { ok: true, data: { text: 'x', model: 'm' } }, { ok: false }];
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { batch: { supported: true } } } } } },
+        });
+        const results: unknown[] = [
+            undefined,
+            { ok: true },
+            { ok: true, data: {} },
+            { ok: true, data: { text: 'x', model: 'm' } },
+            { ok: false },
+            { ok: false, error: {} },
+            { ok: false, error: { code: 'http', message: 'x' } },
+        ];
         for (const malformed of results) {
             adapter.generate = async () => malformed as never;
-            expect(await llm.m('hi')).toMatchObject({
-                ok: false,
-                error: { code: 'unexpected', retryable: false, attempts: 1 },
-            });
+            for (const batch of [false, true]) {
+                expect(await llm.generate({ model: 'm', messages, batch })).toMatchObject({
+                    ok: false,
+                    error: { code: 'unexpected', retryable: false, attempts: 1 },
+                });
+            }
         }
+        const usage = { inputTokens: 0, outputTokens: null, reasoningTokens: 2 };
+        const lenient = { text: '', model: 'm', usage, finishReason: null, ms: 1 };
+        adapter.generate = async () => ({ ok: true, data: lenient }) as never;
+        for (const batch of [false, true]) {
+            expect(await llm.generate({ model: 'm', messages, batch })).toMatchObject({ ok: true, data: { text: '' } });
+        }
+    });
+
+    it('maps invalid adapter usage counts to unexpected', async () => {
+        const adapter = createFakeProvider();
+        const llm = createLlm({
+            providers: { p: { adapter, models: { m: { model: 'm', capabilities: { batch: { supported: true } } } } } },
+        });
+        const full = { inputTokens: 1, outputTokens: 1, reasoningTokens: null };
+        const usages: unknown[] = [
+            {},
+            { inputTokens: 1, outputTokens: 1 },
+            { ...full, inputTokens: '5' },
+            { ...full, outputTokens: -1 },
+            { ...full, reasoningTokens: Number.NaN },
+            { ...full, inputTokens: Infinity },
+        ];
+        const results: unknown[] = usages.flatMap((usage) => [
+            { ok: true, data: { text: '{}', model: 'm', usage, ms: 1 } },
+            { ok: false, error: { code: 'http', message: 'x', retryable: false, usage } },
+        ]);
+        for (const malformed of results) {
+            adapter.generate = async () => malformed as never;
+            for (const batch of [false, true]) {
+                expect(await llm.generate({ model: 'm', messages, batch })).toMatchObject({
+                    ok: false,
+                    error: { code: 'unexpected', message: 'fake returned a malformed result', attempts: 1 },
+                });
+            }
+        }
+        const error = { code: 'http', message: 'x', retryable: false, usage: full };
+        adapter.generate = async () => ({ ok: false, error }) as never;
+        expect(await llm.generate({ model: 'm', messages })).toMatchObject({ ok: false, error: { code: 'http' } });
     });
 });
 
@@ -1240,7 +1717,7 @@ describe('provider extra hooks', () => {
         expect(adapter.calls.map((call) => call.extra)).toEqual([{ a: 2 }]);
     });
 
-    it('rejects an extra with an own __proto__ key, which merging would drop', async () => {
+    it('rejects extra with own __proto__ key', async () => {
         const adapter = createFakeProvider();
         const extra = JSON.parse('{"__proto__": {"num_ctx": 1}}');
         expect(() => createLlm({ providers: { p: { adapter, extra, models: { m: 'id' } } } })).toThrow(
@@ -1276,6 +1753,43 @@ describe('provider extra hooks', () => {
             [{ a: 1 }, {}, {}],
         ]);
         expect(adapter.calls[0]?.extra).toEqual({ merged: 3 });
+    });
+
+    it('default merge: preserves configured extra keys when call sets undefined', async () => {
+        const adapter = createFakeProvider();
+        const llm = createLlm({
+            providers: { p: { adapter, extra: { k: 1 }, models: { m: { model: 'm', extra: { j: 2 } } } } },
+        });
+        const result = await llm.generate({ model: 'm', messages }, { extra: { k: undefined, j: undefined, n: 3 } });
+        expect(adapter.calls[0]?.extra).toEqual({ k: 1, j: 2, n: 3 });
+        expect(result.ok && Object.keys(result.data.settings.extra ?? {})).toEqual(['k', 'j', 'n']);
+        expect(result.ok && result.data.settings.extra).toEqual({ k: 1, j: 2, n: 3 });
+    });
+
+    it('passes cloned extra layers to mergeExtra', async () => {
+        const seen: unknown[][] = [];
+        const adapter = {
+            ...createFakeProvider(),
+            mergeExtra(given: Record<string, unknown>[]) {
+                const nested = given.map((layer) => layer.nested as { deep: number } | undefined);
+                seen.push(nested.map((entry) => entry?.deep));
+                for (const entry of nested) {
+                    if (entry !== undefined) {
+                        entry.deep = 99;
+                    }
+                }
+                return {};
+            },
+        };
+        const llm = createLlm({ providers: { p: { adapter, extra: { nested: { deep: 1 } }, models: { m: 'm' } } } });
+        const own = { nested: { deep: 2 } };
+        await llm.generate({ model: 'm', messages }, { extra: own });
+        await llm.generate({ model: 'm', messages }, { extra: own });
+        expect(seen).toEqual([
+            [1, undefined, 2],
+            [1, undefined, 2],
+        ]);
+        expect(own.nested.deep).toBe(2);
     });
 });
 
@@ -1323,7 +1837,6 @@ describe('settings, attempts and answers of errors', () => {
             },
         });
         adapter.reply(reasoned('{"kind":"noun"}'));
-        // Detached model function still captures and reports complete request settings
         const call: LlmModelCall = llm.flash;
         const result = await call('hi', {
             response_format: format,
@@ -1365,7 +1878,7 @@ describe('settings, attempts and answers of errors', () => {
         });
     });
 
-    it('settings, models and the stored configuration are copies: changing one changes no later call', async () => {
+    it('clones settings, models, and config to prevent external mutation', async () => {
         const adapter = createFakeProvider();
         const defaults = { stop: ['END'] };
         const extra = { options: { num_ctx: 2048 } };
@@ -1393,7 +1906,71 @@ describe('settings, attempts and answers of errors', () => {
         });
     });
 
-    it('leaves out what was not sent: switched-off capabilities, no JSON, no tools, empty extra', async () => {
+    it('snapshots queued request so caller mutations do not affect execution', async () => {
+        const adapter = createFakeProvider('p', { json: 'native', tools: true });
+        const llm = createLlm({
+            providers: {
+                p: {
+                    adapter,
+                    models: {
+                        m: { model: 'm', modelLimits: { concurrency: 1 }, capabilities: { json: true, tools: true } },
+                    },
+                },
+            },
+        });
+        adapter.reply(answer('{"kind":"noun"}'));
+        const turns: LlmMessage[] = [{ role: 'user', content: 'original' }];
+        const stop = ['S'];
+        const tools: LlmTool[] = [{ type: 'function', function: { name: 'f', parameters: { type: 'object' } } }];
+        const own = structuredClone(schema);
+        const extra = { nested: { deep: 1 } };
+        const first = llm.generate({ model: 'm', messages });
+        const pending = llm.generate(
+            {
+                model: 'm',
+                messages: turns,
+                stop,
+                tools,
+                response_format: { type: 'json_schema', json_schema: { name: 'word', schema: own } },
+            },
+            { extra },
+        );
+        turns.push({ role: 'user', content: 'injected' });
+        stop.push('T');
+        (tools[0] as LlmTool).function.name = 'g';
+        own.required.push('zzz');
+        extra.nested.deep = 2;
+        await first;
+        const result = await pending;
+        expect(result).toMatchObject({ ok: true, data: { json: { kind: 'noun' }, settings: { stop: ['S'] } } });
+        const sent = adapter.calls[1];
+        expect(sent?.request.messages).toEqual([{ role: 'user', content: 'original' }]);
+        expect(sent?.request.stop).toEqual(['S']);
+        expect(sent?.request.tools?.[0]?.function.name).toBe('f');
+        expect(sent?.extra).toEqual({ nested: { deep: 1 } });
+    });
+
+    it('isolates stored defaults and extras from adapter mutations', async () => {
+        const adapter = createFakeProvider();
+        const seen: unknown[] = [];
+        adapter.reply((call) => {
+            seen.push(structuredClone({ stop: call.request.stop, extra: call.extra }));
+            (call.request.stop as string[]).push('CORRUPT');
+            (call.extra.nested as { deep: number }).deep = 99;
+            return answer('ok')(call);
+        });
+        const llm = createLlm({
+            defaults: { stop: ['X'] },
+            providers: { p: { adapter, extra: { nested: { deep: 1 } }, models: { m: 'm' } } },
+        });
+        const first = await llm.m('hi');
+        await llm.m('hi');
+        const sent = { stop: ['X'], extra: { nested: { deep: 1 } } };
+        expect(seen).toEqual([sent, sent]);
+        expect(first.ok && first.data.settings).toMatchObject(sent);
+    });
+
+    it('omits unset or disabled fields from reported settings', async () => {
         const adapter = createFakeProvider();
         const capabilities = { batch: { supported: true }, webSearch: { supported: true } };
         const llm = createLlm({ providers: { p: { adapter, models: { m: { model: 'id', capabilities } } } } });
@@ -1408,7 +1985,7 @@ describe('settings, attempts and answers of errors', () => {
         });
     });
 
-    it('invalid_json: the answer with its reasoning and parsed json as output, next to text, usage, model and ms', async () => {
+    it('invalid_json: includes partial output with reasoning and parsed json', async () => {
         const adapter = createFakeProvider('p', { json: 'native' });
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'id', capabilities: { json: true } } } } },
@@ -1456,31 +2033,29 @@ describe('settings, attempts and answers of errors', () => {
         });
     });
 
-    it('prompt mode: attempts counts the retries, the error keeps the last answer', async () => {
+    it('prompt mode: attaches single-attempt output to invalid_json error', async () => {
         const adapter = createFakeProvider('p', { json: 'prompt' });
         const llm = createLlm({
             limiterOptions: { maxRetries: 2 },
             providers: { p: { adapter, models: { m: { model: 'id', capabilities: { json: true } } } } },
         });
-        adapter.reply(reasoned('not json'), reasoned('{"kind":"noun"}'));
-        const fixed = await llm.m('hi', { response_format: format });
-        expect(fixed).toMatchObject({ ok: true, data: { json: { kind: 'noun' }, attempts: 2 } });
-        adapter.reply(reasoned('not json'), reasoned('{"kind":"x"}'), reasoned('{"kind":"y"}'));
+        adapter.reply(reasoned('{"kind":"y"}'), reasoned('{"kind":"noun"}'));
         const failed = await llm.m('hi', { response_format: format });
         expect(failed).toMatchObject({
             ok: false,
             error: {
                 code: 'invalid_json',
-                retryable: true,
+                retryable: false,
                 text: '{"kind":"y"}',
                 output: { text: '{"kind":"y"}', json: { kind: 'y' }, reasoning: 'thought' },
                 settings: { jsonMode: 'prompt' },
-                attempts: 3,
+                attempts: 1,
             },
         });
+        expect(adapter.calls).toHaveLength(1);
     });
 
-    it('truncated and blocked answers of the adapter come back as output with the model and provider names', async () => {
+    it('enriches truncated and blocked adapter output with model and provider names', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({ providers: { p: { adapter, models: { m: 'id' } } } });
         for (const code of ['truncated', 'blocked'] as const) {
@@ -1514,7 +2089,7 @@ describe('settings, attempts and answers of errors', () => {
         }
     });
 
-    it('settings without output on transport and limiter errors, neither before the request is prepared', async () => {
+    it('includes settings on transport/limiter errors but omits them on pre-prepare errors', async () => {
         const adapter = createFakeProvider();
         const llm = createLlm({
             providers: { p: { adapter, models: { m: { model: 'id', modelLimits: { tpm: 10 } } } } },

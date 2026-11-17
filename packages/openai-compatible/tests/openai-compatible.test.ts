@@ -3,9 +3,33 @@
 
 import { describe, expect, it } from 'bun:test';
 import type { LlmProviderRequest, LlmProviderSupport } from '@smart-llm/core';
-import { createOpenAiCompatibleProvider, statusError } from '../src/index.js';
+import { createOpenAiCompatibleProvider, type OpenAiCompatibleOptions, statusError } from '../src/index.js';
 
+// -------------------------------------------------------------------
+// --- 1. Types
+// -------------------------------------------------------------------
+
+/** Recorded HTTP request sent to the mock fetch implementation. */
 type Sent = { url: string; init: RequestInit; body: Record<string, unknown> | undefined };
+
+// -------------------------------------------------------------------
+// --- 2. Constants
+// -------------------------------------------------------------------
+
+const supports: LlmProviderSupport = { images: true, tools: true, reasoning: true, json: 'native' };
+
+const request: LlmProviderRequest = {
+    model: 'm',
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 64,
+    reasoning_effort: 'low',
+};
+
+const call = { signal: new AbortController().signal, extra: {} };
+
+// -------------------------------------------------------------------
+// --- 3. Private Functions
+// -------------------------------------------------------------------
 
 /** Creates fake queued fetch implementation recording requests. */
 function fakeFetch(...answers: (() => Response)[]): { fetch: typeof fetch; sent: Sent[] } {
@@ -36,19 +60,8 @@ function completion(finishReason = 'stop', message: Record<string, unknown> = { 
     });
 }
 
-const supports: LlmProviderSupport = { images: true, tools: true, reasoning: true, json: 'native' };
-
-const request: LlmProviderRequest = {
-    model: 'm',
-    messages: [{ role: 'user', content: 'hi' }],
-    max_tokens: 64,
-    reasoning_effort: 'low',
-};
-
-const call = { signal: new AbortController().signal, extra: {} };
-
 describe('createOpenAiCompatibleProvider', () => {
-    it('posts the request with the output limit field, extra and mapBody, and the key as bearer token', async () => {
+    it('posts request with mapped maxTokensField, extra, mapBody, and bearer token', async () => {
         const fake = fakeFetch(completion());
         const provider = createOpenAiCompatibleProvider({
             name: 'p',
@@ -250,7 +263,7 @@ describe('createOpenAiCompatibleProvider', () => {
         }
     });
 
-    it('fails with a retryable unexpected, the answer as output, for tool call arguments that are no JSON object', async () => {
+    it('fails with retryable unexpected and output for non-object tool call arguments', async () => {
         for (const args of ['{"city": "Graz"', '[1]']) {
             const fake = fakeFetch(
                 completion('tool_calls', {
@@ -298,7 +311,7 @@ describe('createOpenAiCompatibleProvider', () => {
                     },
                     400,
                 ),
-                { code: 'invalid_json', status: 400, retryable: true, text: '{"kind":' },
+                { code: 'invalid_json', status: 400, retryable: false, text: '{"kind":' },
             ],
             [
                 json({ error: { message: 'Failed to call a function', code: 'tool_use_failed' } }, 400),
@@ -366,7 +379,7 @@ describe('createOpenAiCompatibleProvider', () => {
         expect(fake.sent[0]?.url).toBe('http://x/v1/models');
     });
 
-    it('never supports batch calls or web search, and answers them with unsupported instead of a call', async () => {
+    it('rejects batch and web_search as unsupported without sending request', async () => {
         const fake = fakeFetch(completion());
         const provider = createOpenAiCompatibleProvider({
             name: 'p',
@@ -385,7 +398,7 @@ describe('createOpenAiCompatibleProvider', () => {
         expect(fake.sent).toHaveLength(0);
     });
 
-    it('returns unexpected instead of throwing for a failing body, a null response or a bad model list', async () => {
+    it('returns unexpected instead of throwing on mapBody errors, null body, or bad model list', async () => {
         const options = { name: 'p', baseUrl: 'http://x', supports };
         const throwing = createOpenAiCompatibleProvider({
             ...options,
@@ -499,7 +512,7 @@ describe('answers of failed calls', () => {
     });
 });
 
-describe('statusError', () => {
+describe('embeddings', () => {
     it('embeds all texts with one /embeddings call, sorted by index, with dimensions and token usage', async () => {
         const fake = fakeFetch(
             json({
@@ -536,7 +549,22 @@ describe('statusError', () => {
         expect(fake.sent[0]?.body).toEqual({ model: 'bge', input: ['a', 'b'], dimensions: 2 });
     });
 
-    it('answers embeddings without support, task or title with unsupported, and maps bad answers and errors', async () => {
+    it('reports null input tokens for a negative or non-finite embeddings prompt_tokens', async () => {
+        for (const tokens of ['-1', '1e400']) {
+            const body = `{"data":[{"index":0,"embedding":[1]}],"usage":{"prompt_tokens":${tokens}}}`;
+            const fake = fakeFetch(() => new Response(body));
+            const provider = createOpenAiCompatibleProvider({
+                name: 'p',
+                baseUrl: 'http://box',
+                supports: { embeddings: true },
+                fetch: fake.fetch,
+            });
+            const result = await provider.embed?.({ model: 'm', input: [{ text: 'a' }] }, { signal: call.signal });
+            expect(result).toMatchObject({ ok: true, data: { usage: { inputTokens: null } } });
+        }
+    });
+
+    it('rejects unsupported embeddings, task, or title, and maps invalid responses/errors', async () => {
         const fake = fakeFetch(json({ data: [{ index: 0, embedding: [1] }] }));
         const signal = { signal: call.signal };
         const plain = createOpenAiCompatibleProvider({ name: 'p', baseUrl: 'http://box', fetch: fake.fetch });
@@ -613,11 +641,254 @@ describe('statusError', () => {
             { ok: false, error: { code: 'http', status: 503, retryable: true } },
         ]);
     });
+});
 
+describe('statusError', () => {
     it('reads retry-after as seconds or an HTTP date', () => {
         expect(statusError(429, 'x', '1.5')).toMatchObject({ retryAfterMs: 1500 });
         const later = new Date(Date.now() + 60_000).toUTCString();
         expect((statusError(503, 'x', later).retryAfterMs ?? 0) > 50_000).toBe(true);
         expect(statusError(408, 'x', null)).toEqual({ code: 'http', message: 'x', retryable: true, status: 408 });
+    });
+});
+
+describe('caller abort and internal timeout', () => {
+    /** Fetch that rejects with the abort reason once the signal fires. */
+    function hangingFetch(_url: string, init: RequestInit): Promise<Response> {
+        return new Promise((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+    }
+    const hanging = hangingFetch as typeof fetch;
+
+    it('reports a caller AbortSignal.timeout as aborted on generate, embed and listModels', async () => {
+        const provider = createOpenAiCompatibleProvider({
+            name: 'p',
+            baseUrl: 'http://x',
+            supports: { embeddings: true },
+            fetch: hanging,
+        });
+        const aborted = { ok: false, error: { code: 'aborted', retryable: false } };
+        expect(await provider.generate(request, { signal: AbortSignal.timeout(5), extra: {} })).toMatchObject(aborted);
+        expect(
+            await provider.embed?.({ model: 'm', input: [{ text: 'a' }] }, { signal: AbortSignal.timeout(5) }),
+        ).toMatchObject(aborted);
+        expect(await provider.listModels?.({ signal: AbortSignal.timeout(5) })).toMatchObject(aborted);
+    });
+
+    it('reports a caller abort with a TimeoutError reason as aborted', async () => {
+        const controller = new AbortController();
+        controller.abort(new DOMException('caller deadline', 'TimeoutError'));
+        const provider = createOpenAiCompatibleProvider({
+            name: 'p',
+            baseUrl: 'http://x',
+            fetch: ((_url: string, init: RequestInit) =>
+                init.signal?.aborted ? Promise.reject(init.signal.reason) : hanging(_url, init)) as typeof fetch,
+        });
+        expect(await provider.generate(request, { signal: controller.signal, extra: {} })).toMatchObject({
+            ok: false,
+            error: { code: 'aborted', retryable: false },
+        });
+    });
+
+    it('reports the internal timeoutMs as a retryable timeout on generate, embed and listModels', async () => {
+        const provider = createOpenAiCompatibleProvider({
+            name: 'p',
+            baseUrl: 'http://x',
+            supports: { embeddings: true },
+            timeoutMs: 5,
+            fetch: hanging,
+        });
+        const timeout = { ok: false, error: { code: 'timeout', retryable: true } };
+        expect(await provider.generate(request, call)).toMatchObject(timeout);
+        expect(await provider.embed?.({ model: 'm', input: [{ text: 'a' }] }, { signal: call.signal })).toMatchObject(
+            timeout,
+        );
+        expect(await provider.listModels?.({ signal: call.signal })).toMatchObject(timeout);
+        expect(await provider.listModels?.()).toMatchObject(timeout);
+    });
+});
+
+describe('tool call normalization', () => {
+    it('reads empty-string arguments as an empty object and skips tool calls without a name', async () => {
+        const fake = fakeFetch(
+            completion('tool_calls', {
+                content: null,
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'now', arguments: '' } },
+                    { id: 'c2', type: 'function', function: { name: '', arguments: '{}' } },
+                ],
+            }),
+        );
+        const provider = createOpenAiCompatibleProvider({ name: 'p', baseUrl: 'http://x', fetch: fake.fetch });
+        const result = await provider.generate(request, call);
+        expect(result).toMatchObject({ ok: true, data: { finishReason: 'tool_calls' } });
+        expect(result.ok ? result.data.toolCalls : undefined).toEqual([
+            { id: 'c1', type: 'function', function: { name: 'now', arguments: '{}' } },
+        ]);
+    });
+
+    it('sends empty-string history arguments as an empty object and leaves out empty tool_calls', async () => {
+        const fake = fakeFetch(completion());
+        const provider = createOpenAiCompatibleProvider({ name: 'p', baseUrl: 'http://x', fetch: fake.fetch });
+        await provider.generate(
+            {
+                model: 'm',
+                messages: [
+                    { role: 'user', content: 'time?' },
+                    {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'now', arguments: '' } }],
+                    },
+                    { role: 'tool', tool_call_id: 'c1', content: 'noon' },
+                    { role: 'assistant', content: 'It is noon.', tool_calls: [] },
+                    { role: 'user', content: 'thanks' },
+                ],
+            },
+            call,
+        );
+        expect(fake.sent[0]?.body?.messages).toEqual([
+            { role: 'user', content: 'time?' },
+            {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{ id: 'c1', type: 'function', function: { name: 'now', arguments: '{}' } }],
+            },
+            { role: 'tool', tool_call_id: 'c1', content: 'noon' },
+            { role: 'assistant', content: 'It is noon.' },
+            { role: 'user', content: 'thanks' },
+        ]);
+    });
+});
+
+describe('malformed completions', () => {
+    /** Creates provider answering every call with given body. */
+    function answering(body: unknown) {
+        return createOpenAiCompatibleProvider({ name: 'p', baseUrl: 'http://x', fetch: fakeFetch(json(body)).fetch });
+    }
+
+    it('fails with unexpected for a choice or message that is no object', async () => {
+        for (const choices of [[{ finish_reason: 'stop', message: null }], [{ message: 'str' }], [null], 'abc']) {
+            expect(await answering({ choices }).generate(request, call)).toEqual({
+                ok: false,
+                error: { code: 'unexpected', message: 'The response has no choice', retryable: false },
+            });
+        }
+    });
+
+    it('falls back to the requested model for an empty or non-string model', async () => {
+        for (const model of ['', 42, null]) {
+            const body = { model, choices: [{ finish_reason: 'stop', message: { content: 'ok' } }] };
+            expect(await answering(body).generate(request, call)).toMatchObject({ ok: true, data: { model: 'm' } });
+        }
+    });
+
+    it('reads non-numeric usage fields as null and clamps output tokens at 0', async () => {
+        const message = { content: 'ok' };
+        const odd = {
+            choices: [{ finish_reason: 'stop', message }],
+            usage: {
+                prompt_tokens: '5',
+                completion_tokens: '10',
+                completion_tokens_details: { reasoning_tokens: '3' },
+            },
+        };
+        expect(await answering(odd).generate(request, call)).toMatchObject({
+            ok: true,
+            data: { usage: { inputTokens: null, outputTokens: null, reasoningTokens: null } },
+        });
+        const exclusive = {
+            choices: [{ finish_reason: 'stop', message }],
+            usage: { prompt_tokens: 5, completion_tokens: 10, completion_tokens_details: { reasoning_tokens: 300 } },
+        };
+        expect(await answering(exclusive).generate(request, call)).toMatchObject({
+            ok: true,
+            data: { usage: { inputTokens: 5, outputTokens: 0, reasoningTokens: 300 } },
+        });
+        const negative = {
+            choices: [{ finish_reason: 'stop', message }],
+            usage: { prompt_tokens: -1, completion_tokens: -10, completion_tokens_details: { reasoning_tokens: -3 } },
+        };
+        expect(await answering(negative).generate(request, call)).toMatchObject({
+            ok: true,
+            data: { usage: { inputTokens: null, outputTokens: null, reasoningTokens: null } },
+        });
+    });
+});
+
+describe('options snapshot', () => {
+    it('ignores mutations of options after creation', async () => {
+        const fake = fakeFetch(completion('stop', { content: 'ok', thought: 'first' }));
+        const reasoningFields = ['thought'];
+        const supports: { embeddings?: true } = { embeddings: true };
+        const options: OpenAiCompatibleOptions = {
+            name: 'a',
+            baseUrl: 'http://x',
+            supports,
+            maxTokensField: 'max_completion_tokens',
+            reasoningFields,
+            fetch: fake.fetch,
+        };
+        const provider = createOpenAiCompatibleProvider(options);
+        options.name = 'b';
+        options.maxTokensField = 'max_tokens';
+        options.reasoningMessageField = 'injected';
+        options.mapBody = (body) => ({ ...body, mapped: true });
+        delete supports.embeddings;
+        reasoningFields[0] = 'other';
+        expect(await provider.generate({ ...request, web_search: true }, call)).toMatchObject({
+            error: { code: 'unsupported', message: 'a does not support web search' },
+        });
+        expect(await provider.generate(request, call)).toMatchObject({ ok: true, data: { reasoning: 'first' } });
+        expect(fake.sent[0]?.body).toMatchObject({ max_completion_tokens: 64 });
+        expect(fake.sent[0]?.body).not.toHaveProperty('max_tokens');
+        expect(fake.sent[0]?.body).not.toHaveProperty('mapped');
+        expect(provider.supports.embeddings).toBe(true);
+        await provider.embed?.({ model: 'm', input: [{ text: 'a' }] }, { signal: call.signal });
+        expect(fake.sent[1]?.url).toBe('http://x/embeddings');
+        const history: LlmProviderRequest = {
+            model: 'm',
+            messages: [
+                { role: 'user', content: 'hi' },
+                { role: 'assistant', content: 'hello', reasoning: 'thinking' },
+                { role: 'user', content: 'again' },
+            ],
+        };
+        await provider.generate(history, call);
+        expect(fake.sent[2]?.body?.messages).toEqual([
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'hello' },
+            { role: 'user', content: 'again' },
+        ]);
+    });
+
+    it('falls back to max_completion_tokens for a null maxTokensField', async () => {
+        const fake = fakeFetch(completion());
+        const provider = createOpenAiCompatibleProvider({
+            name: 'p',
+            baseUrl: 'http://x',
+            maxTokensField: null as never,
+            fetch: fake.fetch,
+        });
+        await provider.generate(request, call);
+        expect(fake.sent[0]?.body).toMatchObject({ max_completion_tokens: 64 });
+        expect(fake.sent[0]?.body).not.toHaveProperty('null');
+    });
+
+    it('calls a method-style mapBody with options as this', async () => {
+        const fake = fakeFetch(completion());
+        const options = {
+            name: 'p',
+            baseUrl: 'http://x',
+            tag: 'from-this',
+            fetch: fake.fetch,
+            mapBody(this: { tag: string }, body: Record<string, unknown>) {
+                return { ...body, tag: this.tag };
+            },
+        };
+        const provider = createOpenAiCompatibleProvider(options as OpenAiCompatibleOptions);
+        expect(await provider.generate(request, call)).toMatchObject({ ok: true });
+        expect(fake.sent[0]?.body).toMatchObject({ tag: 'from-this' });
     });
 });

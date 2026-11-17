@@ -8,6 +8,13 @@ import { describe, expect, it } from 'bun:test';
 import { createLlm } from '@smart-llm/core';
 import { createGeminiProvider } from '../../src/index.js';
 
+// -------------------------------------------------------------------
+// --- 1. Constants
+// -------------------------------------------------------------------
+
+/** API key from env; suite skipped without it. */
+const API_KEY = process.env.GEMINI_API_KEY;
+
 /** Test documents with section titles. */
 const DOCUMENTS = [
     { text: 'The bakery opens at six and sells rye bread and croissants.', title: 'Shop' },
@@ -18,22 +25,32 @@ const DOCUMENTS = [
 /** Test query corresponding to the second document. */
 const QUERY = 'Which organelle makes the energy carrier of the cell?';
 
-/** Test LLM instance with Gemini embedding models. */
-const llm = createLlm({
-    providers: {
-        gemini: {
-            adapter: createGeminiProvider({ timeoutMs: 30_000 }),
-            models: {
-                embed1: { model: 'gemini-embedding-001', capabilities: { embeddings: true } },
-                embed2: { model: 'gemini-embedding-2', capabilities: { embeddings: true } },
-                embed2Pairs: {
-                    model: 'gemini-embedding-2',
-                    capabilities: { embeddings: { supported: true, maxInputs: 2 } },
-                },
-            },
-        },
-    },
-});
+if (API_KEY === undefined || API_KEY === '') {
+    console.warn('[live] GEMINI_API_KEY not set: Gemini embed live tests skipped');
+}
+
+/** Test LLM instance with Gemini embedding models; undefined without key. */
+const llm = API_KEY
+    ? createLlm({
+          providers: {
+              gemini: {
+                  adapter: createGeminiProvider({ timeoutMs: 30_000 }),
+                  models: {
+                      embed1: { model: 'gemini-embedding-001', capabilities: { embeddings: true } },
+                      embed2: { model: 'gemini-embedding-2', capabilities: { embeddings: true } },
+                      embed2Pairs: {
+                          model: 'gemini-embedding-2',
+                          capabilities: { embeddings: { supported: true, maxInputs: 2 } },
+                      },
+                  },
+              },
+          },
+      })
+    : undefined;
+
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
 
 /** Computes cosine similarity between two numeric vectors. */
 function cosine(a: number[], b: number[]): number {
@@ -48,13 +65,14 @@ function cosine(a: number[], b: number[]): number {
     return dot / Math.sqrt(normA * normB);
 }
 
-describe('Gemini embeddings through createLlm (live, free key)', () => {
+describe.skipIf(llm === undefined)('Gemini embeddings through createLlm (live, free key)', () => {
+    const live = llm as NonNullable<typeof llm>;
     for (const model of ['embed1', 'embed2'] as const) {
-        it(`${model}: document and query vectors of 768 dimensions, the query closest to its answer`, async () => {
+        it(`${model}: ranks matching document closest for 768d embeddings`, async () => {
             // gemini-embedding-001 accepts one title per provider call; omit titles for batch
             const input = model === 'embed2' ? DOCUMENTS : DOCUMENTS.map((document) => document.text);
-            const documents = await llm.embed({ model, input, task: 'document', dimensions: 768 });
-            const query = await llm.embed({ model, input: QUERY, task: 'query', dimensions: 768 });
+            const documents = await live.embed({ model, input, task: 'document', dimensions: 768 });
+            const query = await live.embed({ model, input: QUERY, task: 'query', dimensions: 768 });
             expect(documents.ok && query.ok).toBe(true);
             if (!(documents.ok && query.ok)) {
                 console.log(JSON.stringify([documents, query]));
@@ -70,8 +88,9 @@ describe('Gemini embeddings through createLlm (live, free key)', () => {
     }
 
     it('splits into provider calls of maxInputs and keeps the input order', async () => {
-        const whole = await llm.embed({ model: 'embed2', input: DOCUMENTS, task: 'document', dimensions: 256 });
-        const pairs = await llm.embed({ model: 'embed2Pairs', input: DOCUMENTS, task: 'document', dimensions: 256 });
+        const whole = await live.embed({ model: 'embed2', input: DOCUMENTS, task: 'document', dimensions: 256 });
+        const pairs = await live.embed({ model: 'embed2Pairs', input: DOCUMENTS, task: 'document', dimensions: 256 });
+        expect(whole).toMatchObject({ ok: true, data: { calls: 1 } });
         expect(pairs).toMatchObject({ ok: true, data: { calls: 2 } });
         if (whole.ok && pairs.ok) {
             for (const [index, vector] of pairs.data.embeddings.entries()) {

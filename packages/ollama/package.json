@@ -1,6 +1,6 @@
 {
   "name": "@smart-llm/ollama",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "smart-llm provider adapter for a local Ollama server",
   "keywords": [],
   "author": "Martin Winkler",

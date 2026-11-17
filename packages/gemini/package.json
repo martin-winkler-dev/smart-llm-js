@@ -1,6 +1,6 @@
 {
   "name": "@smart-llm/gemini",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "smart-llm provider adapter for Gemini (Developer API and Vertex AI) through smart-genai",
   "keywords": [],
   "author": "Martin Winkler",
@@ -50,6 +50,6 @@
   },
   "dependencies": {
     "@smart-llm/core": "workspace:^",
-    "smart-genai": "^0.1.0"
+    "smart-genai": "^0.3.0"
   }
 }
